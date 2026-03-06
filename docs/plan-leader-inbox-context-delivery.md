@@ -18,6 +18,22 @@
 
 ---
 
+## Gap analysis (updated 2026-03-06)
+
+The original plan covers the inbox-side problem comprehensively. Two additional gaps were identified during review:
+
+### Gap A: Task completion messages lack task context
+
+The plan's implementation sketch for idle-with-completed-task only emits the task **ID** (e.g., `"completed task #7"`). The leader LLM cannot make informed follow-up decisions (assign next work, re-prioritise) without knowing **what** the task was. The `getTask()` call is already performed in the same handler for hook invocations — we should reuse it to enrich the LLM message with the task subject and (if failed) the failure reason.
+
+### Gap B: Hook / quality-gate results never reach the leader LLM
+
+The `enqueueHook` closure in `leader.ts` suffers from the **same notify-only problem**. After a quality-gate hook runs, outcomes (pass, fail, task reopened, follow-up created) are reported exclusively via `ctx.ui.notify()`. The leader LLM is never told whether a completed task passed or failed its quality gate, so it cannot reason about remediation strategy, reassignment, or pipeline progression.
+
+This is the same class of bug as the inbox issue and should be addressed in the same implementation pass. Change §6 below covers the fix.
+
+---
+
 ## Changes
 
 ### 1. Add `pi` (ExtensionAPI) reference to the leader inbox poll flow
@@ -127,6 +143,16 @@ for (const m of msgs) {
     const idle = isIdleNotification(m.text);
     if (idle) {
         // ... existing hook/status logic unchanged ...
+
+        // Enrich with task subject when available (getTask is already called for hooks).
+        let taskSubject: string | undefined;
+        if (idle.completedTaskId) {
+            const task = await getTask(teamDir, taskListId, idle.completedTaskId);
+            taskSubject = task?.subject;
+        }
+        const taskRef = taskSubject
+            ? `task #${idle.completedTaskId} ("${taskSubject}")`
+            : `task #${idle.completedTaskId}`;
         
         if (idle.failureReason) {
             pendingContextMessages.push(
@@ -134,11 +160,11 @@ for (const m of msgs) {
             );
         } else if (idle.completedTaskId && idle.completedStatus === "failed") {
             pendingContextMessages.push(
-                `[Team] ${name} aborted task #${idle.completedTaskId} and is now idle.`
+                `[Team] ${name} aborted ${taskRef} and is now idle.`
             );
         } else if (idle.completedTaskId) {
             pendingContextMessages.push(
-                `[Team] ${name} completed task #${idle.completedTaskId} and is now idle.`
+                `[Team] ${name} completed ${taskRef} and is now idle. Consider reviewing their work or assigning new tasks.`
             );
         } else {
             pendingContextMessages.push(
@@ -243,12 +269,56 @@ Actually, this is better handled at the `leader.ts` level via the existing `inbo
 
 ---
 
+### 6. Deliver hook / quality-gate outcomes to the leader LLM
+
+**File:** `extensions/teams/leader.ts` (inside the `enqueueHook` closure)
+
+**What:** After a quality-gate hook runs, inject a context message into the leader's conversation summarising the outcome. This uses the same `pi.sendUserMessage()` / `pi.sendMessage()` mechanism as inbox delivery.
+
+**Why:** Hook outcomes (pass/fail, task reopened, follow-up created) are currently only shown via `ctx.ui.notify()`. The leader LLM never learns whether a teammate's completed work passed quality gates, so it cannot reason about remediation, reassignment, or pipeline progression — the same class of bug as the inbox problem.
+
+**Categorization:**
+- **Hook passed** → informational (`pi.sendMessage` with `deliverAs: "nextTurn"`). The leader should know, but doesn't need to act urgently.
+- **Hook failed** (with or without reopen/followup) → urgent (`pi.sendUserMessage`). The leader may need to reassign, escalate, or adjust strategy.
+
+**Implementation sketch** (at the end of the `enqueueHook` closure, after existing `ctx.ui.notify()` calls):
+
+```typescript
+// After existing notify calls — inject into LLM context.
+if (ok) {
+    const taskRef = task?.id ? ` for task #${task.id}` : "";
+    const taskSubject = task?.subject ? ` ("${task.subject}")` : "";
+    pi.sendMessage(
+        {
+            customType: "team-hook-result",
+            content: `[Team] Quality gate ${hookName} passed${taskRef}${taskSubject} (${res.durationMs}ms).`,
+            display: `[Hook passed: ${hookName}${taskRef}]`,
+        },
+        { triggerTurn: true, deliverAs: "nextTurn" }
+    );
+} else {
+    const parts: string[] = [];
+    parts.push(`[Team] Quality gate ${hookName} FAILED${task?.id ? ` for task #${task.id}` : ""}${task?.subject ? ` ("${task.subject}")` : ""}.`);
+    parts.push(`Failure: ${failureSummary}`);
+    if (taskReopened && task?.id) parts.push(`Task #${task.id} was auto-reopened to pending.`);
+    if (taskReopenSuppressed && task?.id) parts.push(`Auto-reopen suppressed for task #${task.id} (limit ${maxReopens}).`);
+    if (followupTask?.id) parts.push(`Follow-up task #${followupTask.id} was created.`);
+    parts.push("Review the situation and decide on next steps.");
+
+    pi.sendUserMessage(parts.join("\n"));
+}
+```
+
+**Note:** The `pi` reference is already in scope inside `runLeader()` — no signature changes needed for this change.
+
+---
+
 ## Files Changed (Summary)
 
 | File | Change |
 |---|---|
-| `extensions/teams/leader-inbox.ts` | Add `pi` param; accumulate `pendingContextMessages` / `pendingInfoMessages`; batch-deliver via `sendUserMessage` / `sendMessage` after loop; respect `inboxDelivery` opt-out. |
-| `extensions/teams/leader.ts` | Thread `pi` into `pollLeaderInboxImpl` call; parse `PI_TEAMS_LEADER_INBOX_DELIVERY` env var. |
+| `extensions/teams/leader-inbox.ts` | Add `pi` param; accumulate `pendingContextMessages` / `pendingInfoMessages`; enrich idle messages with task subject via `getTask()`; batch-deliver via `sendUserMessage` / `sendMessage` after loop; respect `inboxDelivery` opt-out. |
+| `extensions/teams/leader.ts` | Thread `pi` into `pollLeaderInboxImpl` call; parse `PI_TEAMS_LEADER_INBOX_DELIVERY` env var; inject hook/quality-gate outcomes into LLM context (§6). |
 | `docs/claude-parity.md` | Update parity matrix: leader inbox delivery → ✅. |
 | `README.md` | Document `PI_TEAMS_LEADER_INBOX_DELIVERY` env var in config table. |
 | `skills/agent-teams/SKILL.md` | Mention that teammate messages are now delivered to the leader's conversation context. |
@@ -268,6 +338,13 @@ Actually, this is better handled at the `leader.ts` level via the existing `inbo
 
 4. **Opt-out:** Set `PI_TEAMS_LEADER_INBOX_DELIVERY=notify`, repeat the DM test, verify the leader LLM does NOT receive the message (only TUI notification).
 
+5. **Task subject in completion messages:** Create a task with a descriptive subject, have a teammate complete it, verify the leader LLM's injected message includes the task subject string (not just the numeric ID).
+
+6. **Hook result delivery:** Configure a quality-gate hook (e.g., a linter that fails), have a teammate complete a task, verify:
+   - Hook failure message appears in the leader LLM's conversation (not just TUI).
+   - If the task is auto-reopened, the LLM message mentions the reopen.
+   - Hook pass messages arrive as `nextTurn` (non-interrupting).
+
 ---
 
 ## Risk Assessment
@@ -278,3 +355,5 @@ Actually, this is better handled at the `leader.ts` level via the existing `inbo
 | Large plan text inflating context | Already truncated to 500 chars in `ctx.ui.notify()`; for LLM delivery, send full plan (the LLM needs it to review). Add a hard cap (e.g., 8KB) with truncation + "see task store" pointer. |
 | Breaking change for users who rely on leader not auto-acting on DMs | `PI_TEAMS_LEADER_INBOX_DELIVERY=notify` opt-out preserves legacy behavior. |
 | `sendUserMessage` called when no `currentCtx` | Already guarded by the `if (!currentCtx || !currentTeamId) return;` at the top of `pollLeaderInbox`. |
+| Double-delivery: hook result + inbox idle arrive as two separate LLM turns | Hooks run asynchronously after inbox poll; the two paths are independent. This is acceptable — the idle message says "completed task X", the hook message says "quality gate passed/failed for task X". They convey different information. |
+| `getTask()` called twice for same task (inbox + hooks) | Negligible cost — file-system read, already cached by OS. Not worth adding a shared cache for. |
