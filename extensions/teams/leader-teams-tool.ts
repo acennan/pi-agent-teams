@@ -37,6 +37,23 @@ import type { ContextMode, WorkspaceMode, SpawnTeammateFn } from "./spawn-types.
 
 type TeamsToolDelegateTask = { text: string; assignee?: string };
 
+/** Build a terse tool result — keeps content to a single text block for minimal context usage. */
+function compactResult(text: string, details: unknown): AgentToolResult<unknown> {
+	return {
+		content: [{ type: "text", text }],
+		details,
+	};
+}
+
+/** Summarize a list of names: inline if ≤3, otherwise just show the count. */
+function summarizeNames(names: string[], style: TeamsStyle, memberTitle: string): string {
+	if (names.length === 0) return `0 ${memberTitle}(s)`;
+	if (names.length <= 3) {
+		return `${names.length} ${memberTitle}(s): ${names.map((n) => formatMemberDisplayName(style, n)).join(", ")}`;
+	}
+	return `${names.length} ${memberTitle}(s)`;
+}
+
 function describeModelSource(source: TeammateModelSource): string {
 	if (source === "override") return "override";
 	if (source === "inherit_leader") return "leader";
@@ -413,10 +430,7 @@ export function registerTeamsTool(opts: {
 				}
 				const names = Array.from(recipients).sort();
 				if (names.length === 0) {
-					return {
-						content: [{ type: "text", text: `No ${strings.memberTitle.toLowerCase()}s to broadcast to` }],
-						details: { action, recipients: [] },
-					};
+					return compactResult(`No ${strings.memberTitle.toLowerCase()}s to broadcast to`, { action, recipients: [] });
 				}
 				const ts = new Date().toISOString();
 				await Promise.all(
@@ -428,10 +442,10 @@ export function registerTeamsTool(opts: {
 						}),
 					),
 				);
-				return {
-					content: [{ type: "text", text: `Broadcast queued for ${names.length} ${strings.memberTitle.toLowerCase()}(s): ${names.map((n) => formatMemberDisplayName(style, n)).join(", ")}` }],
-					details: { action, teamId, recipients: names, mailboxNamespace: TEAM_MAILBOX_NS },
-				};
+				return compactResult(
+					`Broadcast queued for ${summarizeNames(names, style, strings.memberTitle.toLowerCase())}`,
+					{ action, teamId, recipients: names, mailboxNamespace: TEAM_MAILBOX_NS },
+				);
 			}
 
 			if (action === "message_steer") {
@@ -558,10 +572,7 @@ export function registerTeamsTool(opts: {
 
 				const names = Array.from(recipients).sort();
 				if (names.length === 0) {
-					return {
-						content: [{ type: "text", text: `No ${strings.memberTitle.toLowerCase()}s to shut down` }],
-						details: { action, all, recipients: [] },
-					};
+					return compactResult(`No ${strings.memberTitle.toLowerCase()}s to shut down`, { action, all, recipients: [] });
 				}
 
 				const ts = new Date().toISOString();
@@ -588,20 +599,17 @@ export function registerTeamsTool(opts: {
 				}
 
 				await refreshUi();
-				return {
-					content: [{ type: "text", text: `Shutdown requested for ${names.length} ${strings.memberTitle.toLowerCase()}(s): ${names.map((n) => formatMemberDisplayName(style, n)).join(", ")}` }],
-					details: { action, teamId, names, all, reason },
-				};
+				return compactResult(
+					`Shutdown requested for ${summarizeNames(names, style, strings.memberTitle.toLowerCase())}`,
+					{ action, teamId, names, all, reason },
+				);
 			}
 
 			if (action === "member_prune") {
 				const all = params.all === true;
 				const workers = cfg.members.filter((m) => m.role === "worker");
 				if (workers.length === 0) {
-					return {
-						content: [{ type: "text", text: `No ${strings.memberTitle.toLowerCase()}s to prune` }],
-						details: { action, teamId, pruned: [] },
-					};
+					return compactResult(`No ${strings.memberTitle.toLowerCase()}s to prune`, { action, teamId, pruned: [] });
 				}
 
 				const tasks = await listTasks(teamDir, effectiveTlId);
@@ -629,15 +637,15 @@ export function registerTeamsTool(opts: {
 
 				await refreshUi();
 				if (pruned.length === 0) {
-					return {
-						content: [{ type: "text", text: `No stale ${strings.memberTitle.toLowerCase()}s to prune${all ? "" : " (use all=true to force)"}` }],
-						details: { action, teamId, pruned },
-					};
+					return compactResult(
+						`No stale ${strings.memberTitle.toLowerCase()}s to prune${all ? "" : " (use all=true to force)"}`,
+						{ action, teamId, pruned },
+					);
 				}
-				return {
-					content: [{ type: "text", text: `Pruned ${pruned.length} stale ${strings.memberTitle.toLowerCase()}(s): ${pruned.map((n) => formatMemberDisplayName(style, n)).join(", ")}` }],
-					details: { action, teamId, pruned },
-				};
+				return compactResult(
+					`Pruned ${summarizeNames(pruned, style, `stale ${strings.memberTitle.toLowerCase()}`)}`,
+					{ action, teamId, pruned },
+				);
 			}
 
 			if (action === "plan_approve") {
@@ -720,30 +728,19 @@ export function registerTeamsTool(opts: {
 					leaderModelId,
 				});
 				if (!resolved.ok) {
-					return {
-						content: [{ type: "text", text: `Model policy resolution failed: ${resolved.error}` }],
-						details: {
-							action,
-							teamId,
-							error: resolved.error,
-							reason: resolved.reason,
-						},
-					};
+					return compactResult(`Model policy resolution failed: ${resolved.error}`, {
+						action,
+						teamId,
+						error: resolved.error,
+						reason: resolved.reason,
+					});
 				}
 
 				const effectiveModel = formatProviderModel(resolved.value.provider, resolved.value.modelId);
-				const lines: string[] = [
-					"Model policy",
-					"deprecated model family: claude-sonnet-4* (except claude-sonnet-4-5 / claude-sonnet-4.5)",
-					`leader model: ${leaderModel ?? "(unknown)"}`,
-					`leader model deprecated: ${leaderModelDeprecated ? "yes" : "no"}`,
-					`default teammate selection: source=${describeModelSource(resolved.value.source)}, model=${effectiveModel ?? "(teammate default)"}`,
-					"override forms: '<provider>/<modelId>' or '<modelId>' (inherits leader provider when available)",
-				];
 
-				return {
-					content: [{ type: "text", text: lines.join("\n") }],
-					details: {
+				return compactResult(
+					`Model policy: leader=${leaderModel ?? "(unknown)"}${leaderModelDeprecated ? " (deprecated)" : ""}, teammate default=${effectiveModel ?? "(inherit leader)"} (source=${describeModelSource(resolved.value.source)}). Override: '<provider>/<modelId>'.`,
+					{
 						action,
 						teamId,
 						deprecatedPolicy: {
@@ -764,7 +761,7 @@ export function registerTeamsTool(opts: {
 							warnings: resolved.value.warnings,
 						},
 					},
-				};
+				);
 			}
 
 			if (action === "model_policy_check") {
@@ -776,14 +773,9 @@ export function registerTeamsTool(opts: {
 				});
 
 				if (!resolved.ok) {
-					const lines = [
-						"Model policy check: rejected",
-						`input: ${modelInput ?? "(none)"}`,
-						`reason: ${resolved.error}`,
-					];
-					return {
-						content: [{ type: "text", text: lines.join("\n") }],
-						details: {
+					return compactResult(
+						`Model check rejected: ${modelInput ?? "(none)"} — ${resolved.error}`,
+						{
 							action,
 							teamId,
 							accepted: false,
@@ -791,20 +783,14 @@ export function registerTeamsTool(opts: {
 							error: resolved.error,
 							reason: resolved.reason,
 						},
-					};
+					);
 				}
 
 				const resolvedModel = formatProviderModel(resolved.value.provider, resolved.value.modelId);
-				const lines = [
-					"Model policy check: accepted",
-					`input: ${modelInput ?? "(none)"}`,
-					`source: ${describeModelSource(resolved.value.source)}`,
-					`resolved model: ${resolvedModel ?? "(teammate default)"}`,
-				];
-				for (const warning of resolved.value.warnings) lines.push(`warning: ${warning}`);
-				return {
-					content: [{ type: "text", text: lines.join("\n") }],
-					details: {
+				const warnSuffix = resolved.value.warnings.length > 0 ? ` [${resolved.value.warnings.join("; ")}]` : "";
+				return compactResult(
+					`Model check accepted: ${modelInput ?? "(none)"} → ${resolvedModel ?? "(teammate default)"} (${describeModelSource(resolved.value.source)})${warnSuffix}`,
+					{
 						action,
 						teamId,
 						accepted: true,
@@ -815,7 +801,7 @@ export function registerTeamsTool(opts: {
 						model: resolvedModel,
 						warnings: resolved.value.warnings,
 					},
-				};
+				);
 			}
 
 			if (action === "hooks_policy_get") {
@@ -827,15 +813,15 @@ export function registerTeamsTool(opts: {
 				const effectiveFollowupOwner = getTeamsHookFollowupOwnerPolicy(process.env, configuredFollowupOwner);
 				const effectiveMaxReopens = getTeamsHookMaxReopensPerTask(process.env, configuredMaxReopens);
 
-				const lines = [
-					"Hooks policy",
-					`configured: failureAction=${configuredFailureAction ?? "(env default)"}, maxReopensPerTask=${configuredMaxReopens ?? "(env default)"}, followupOwner=${configuredFollowupOwner ?? "(env default)"}`,
-					`effective: failureAction=${effectiveFailureAction}, maxReopensPerTask=${String(effectiveMaxReopens)}, followupOwner=${effectiveFollowupOwner}`,
-				];
+				const overrides: string[] = [];
+				if (configuredFailureAction) overrides.push("failureAction");
+				if (configuredMaxReopens !== undefined) overrides.push("maxReopensPerTask");
+				if (configuredFollowupOwner) overrides.push("followupOwner");
+				const overrideSuffix = overrides.length > 0 ? ` (team overrides: ${overrides.join(", ")})` : " (all env defaults)";
 
-				return {
-					content: [{ type: "text", text: lines.join("\n") }],
-					details: {
+				return compactResult(
+					`Hooks: failureAction=${effectiveFailureAction}, maxReopens=${String(effectiveMaxReopens)}, followupOwner=${effectiveFollowupOwner}${overrideSuffix}`,
+					{
 						action,
 						teamId,
 						configured: {
@@ -849,7 +835,7 @@ export function registerTeamsTool(opts: {
 							followupOwner: effectiveFollowupOwner,
 						},
 					},
-				};
+				);
 			}
 
 			if (action === "hooks_policy_set") {
@@ -897,15 +883,10 @@ export function registerTeamsTool(opts: {
 				const effectiveFailureAction = getTeamsHookFailureAction(process.env, configuredFailureAction);
 				const effectiveFollowupOwner = getTeamsHookFollowupOwnerPolicy(process.env, configuredFollowupOwner);
 				const effectiveMaxReopens = getTeamsHookMaxReopensPerTask(process.env, configuredMaxReopens);
-				const lines = [
-					"Updated hooks policy",
-					`configured: failureAction=${configuredFailureAction ?? "(env default)"}, maxReopensPerTask=${configuredMaxReopens ?? "(env default)"}, followupOwner=${configuredFollowupOwner ?? "(env default)"}`,
-					`effective: failureAction=${effectiveFailureAction}, maxReopensPerTask=${String(effectiveMaxReopens)}, followupOwner=${effectiveFollowupOwner}`,
-				];
 
-				return {
-					content: [{ type: "text", text: lines.join("\n") }],
-					details: {
+				return compactResult(
+					`Updated hooks: failureAction=${effectiveFailureAction}, maxReopens=${String(effectiveMaxReopens)}, followupOwner=${effectiveFollowupOwner}`,
+					{
 						action,
 						teamId,
 						reset,
@@ -920,7 +901,7 @@ export function registerTeamsTool(opts: {
 							followupOwner: effectiveFollowupOwner,
 						},
 					},
-				};
+				);
 			}
 
 			if (action !== "delegate") {
@@ -1043,33 +1024,28 @@ export function registerTeamsTool(opts: {
 			void refreshTasks().finally(renderWidget);
 
 			const lines: string[] = [];
-			if (spawned.length) {
-				lines.push(`Spawned: ${spawned.map((n) => formatMemberDisplayName(style, n)).join(", ")}`);
-			}
-			lines.push(`Delegated ${assignments.length} task(s):`);
-			for (const a of assignments) {
-				lines.push(`- #${a.taskId} → ${formatMemberDisplayName(style, a.assignee)}: ${a.subject}`);
-			}
-			if (warnings.length) {
-				lines.push("\nWarnings:");
-				for (const w of warnings) lines.push(`- ${w}`);
-			}
+			const taskIds = assignments.map((a) => `#${a.taskId}`);
+			const assigneeCounts = new Map<string, number>();
+			for (const a of assignments) assigneeCounts.set(a.assignee, (assigneeCounts.get(a.assignee) ?? 0) + 1);
+			const assigneeSummary = Array.from(assigneeCounts.entries()).map(([n, c]) => `${n}×${c}`).join(", ");
 
-			return {
-				content: [{ type: "text", text: lines.join("\n") }],
-				details: {
-					action,
-					teamId,
-					taskListId: effectiveTlId,
-					contextMode,
-					workspaceMode: requestedWorkspaceMode,
-					model: spawnModel,
-					thinking: spawnThinking,
-					spawned,
-					assignments,
-					warnings,
-				},
-			};
+			lines.push(`Delegated ${assignments.length} task(s) to ${assigneeCounts.size} teammate(s) (${assigneeSummary}).`);
+			lines.push(`Task IDs: ${taskIds.join(", ")}.`);
+			if (spawned.length) lines.push(`Spawned: ${spawned.join(", ")}.`);
+			if (warnings.length) lines.push(`Warnings: ${warnings.join("; ")}`);
+
+			return compactResult(lines.join(" "), {
+				action,
+				teamId,
+				taskListId: effectiveTlId,
+				contextMode,
+				workspaceMode: requestedWorkspaceMode,
+				model: spawnModel,
+				thinking: spawnThinking,
+				spawned,
+				assignments,
+				warnings,
+			});
 		},
 	});
 }
