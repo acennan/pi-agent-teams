@@ -442,6 +442,21 @@ export function runLeader(pi: ExtensionAPI): void {
 		currentCtx.ui.setWidget("pi-teams", widgetFactory);
 	};
 
+	/** Trigger team-aware context compaction if not already in flight. */
+	const tryCompact = () => {
+		if (compactionInFlight || !currentCtx) return;
+		compactionInFlight = true;
+		currentCtx.compact({
+			customInstructions: buildTeamCompactionInstructions(tasks, teammates, teamConfig, style),
+			onComplete: () => {
+				compactionInFlight = false;
+			},
+			onError: () => {
+				compactionInFlight = false;
+			},
+		});
+	};
+
 	const spawnTeammate: SpawnTeammateFn = async (ctx, opts): Promise<SpawnTeammateResult> => {
 		const warnings: string[] = [];
 		const mode: ContextMode = opts.mode ?? "fresh";
@@ -657,21 +672,11 @@ export function runLeader(pi: ExtensionAPI): void {
 				await refreshTasks();
 				renderWidget();
 
-				// Check context usage and proactively trigger compaction at 70%
-				// to ensure team-aware custom instructions are used before pi's
-				// built-in compaction fires (typically ~85%).
+				// Proactively trigger compaction at 70% so team-aware custom
+				// instructions are used before pi's built-in threshold (~85%).
 				const usage = ctx.getContextUsage();
-				if (usage?.percent !== null && usage?.percent !== undefined && usage.percent > 70 && !compactionInFlight) {
-					compactionInFlight = true;
-					ctx.compact({
-						customInstructions: buildTeamCompactionInstructions(tasks, teammates, teamConfig, style),
-						onComplete: () => {
-							compactionInFlight = false;
-						},
-						onError: () => {
-							compactionInFlight = false;
-						},
-					});
+				if (usage?.percent !== null && usage?.percent !== undefined && usage.percent > 70) {
+					tryCompact();
 				}
 			} finally {
 				refreshInFlight = false;
@@ -732,21 +737,11 @@ export function runLeader(pi: ExtensionAPI): void {
 				await refreshTasks();
 				renderWidget();
 
-				// Check context usage and proactively trigger compaction at 70%
-				// to ensure team-aware custom instructions are used before pi's
-				// built-in compaction fires (typically ~85%).
+				// Proactively trigger compaction at 70% so team-aware custom
+				// instructions are used before pi's built-in threshold (~85%).
 				const usage = ctx.getContextUsage();
-				if (usage?.percent !== null && usage?.percent !== undefined && usage.percent > 70 && !compactionInFlight) {
-					compactionInFlight = true;
-					ctx.compact({
-						customInstructions: buildTeamCompactionInstructions(tasks, teammates, teamConfig, style),
-						onComplete: () => {
-							compactionInFlight = false;
-						},
-						onError: () => {
-							compactionInFlight = false;
-						},
-					});
+				if (usage?.percent !== null && usage?.percent !== undefined && usage.percent > 70) {
+					tryCompact();
 				}
 			} finally {
 				refreshInFlight = false;
@@ -783,6 +778,7 @@ export function runLeader(pi: ExtensionAPI): void {
 		renderWidget,
 		pendingPlanApprovals,
 		getContextUsage: () => currentCtx?.getContextUsage(),
+		triggerCompaction: tryCompact,
 	});
 
 	// Summarize-on-completion: replace stale teams tool results with a compact

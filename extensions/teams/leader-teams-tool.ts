@@ -99,6 +99,7 @@ function describeModelSource(source: TeammateModelSource): string {
 function appendContextWarning(
 	result: AgentToolResult<unknown>,
 	usage: ContextUsage | undefined,
+	triggerCompaction?: () => void,
 ): AgentToolResult<unknown> {
 	const percent = usage?.percent;
 	if (percent === null || percent === undefined || percent < 65) return result;
@@ -108,6 +109,13 @@ function appendContextWarning(
 		warning = `⚠️ Context ${percent.toFixed(0)}% full. Finish active tasks before delegating more. Avoid policy queries.`;
 	} else {
 		warning = `Context at ${percent.toFixed(0)}%. Consider wrapping up current delegation cycle.`;
+	}
+
+	// Escalation: trigger proactive compaction at >85% as a secondary safety
+	// net. The primary trigger is the 1-second refresh loop at 70% (Strategy B),
+	// but a large tool result can spike context usage between refresh ticks.
+	if (percent > 85 && triggerCompaction) {
+		triggerCompaction();
 	}
 
 	return {
@@ -232,8 +240,9 @@ export function registerTeamsTool(opts: {
 	renderWidget: () => void;
 	pendingPlanApprovals: Map<string, { requestId: string; name: string; taskId?: string }>;
 	getContextUsage: () => ContextUsage | undefined;
+	triggerCompaction?: () => void;
 }): void {
-	const { pi, teammates, spawnTeammate, getTeamId, getTaskListId, refreshTasks, renderWidget, pendingPlanApprovals, getContextUsage } = opts;
+	const { pi, teammates, spawnTeammate, getTeamId, getTaskListId, refreshTasks, renderWidget, pendingPlanApprovals, getContextUsage, triggerCompaction } = opts;
 
 	pi.registerTool({
 		name: "teams",
@@ -250,7 +259,7 @@ export function registerTeamsTool(opts: {
 
 		async execute(_toolCallId, params: TeamsToolParamsType, signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
 			const result = await executeTeamsAction(params, signal, ctx);
-			return appendContextWarning(result, getContextUsage());
+			return appendContextWarning(result, getContextUsage(), triggerCompaction);
 		},
 	});
 
