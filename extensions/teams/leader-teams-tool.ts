@@ -32,6 +32,7 @@ import {
 	unassignTasksForAgent,
 	updateTask,
 } from "./task-store.js";
+import type { ContextUsage } from "@mariozechner/pi-coding-agent";
 import type { TeammateRpc } from "./teammate-rpc.js";
 import type { ContextMode, WorkspaceMode, SpawnTeammateFn } from "./spawn-types.js";
 
@@ -87,6 +88,32 @@ function describeModelSource(source: TeammateModelSource): string {
 	if (source === "override") return "override";
 	if (source === "inherit_leader") return "leader";
 	return "teammate-default";
+}
+
+/**
+ * Append a context-usage warning to a tool result when context pressure is
+ * high. The warning is placed in a second `content` block so the LLM sees
+ * it alongside the result and can self-regulate (e.g., defer new delegations,
+ * skip policy queries).
+ */
+function appendContextWarning(
+	result: AgentToolResult<unknown>,
+	usage: ContextUsage | undefined,
+): AgentToolResult<unknown> {
+	const percent = usage?.percent;
+	if (percent === null || percent === undefined || percent < 65) return result;
+
+	let warning: string;
+	if (percent > 80) {
+		warning = `⚠️ Context ${percent.toFixed(0)}% full. Finish active tasks before delegating more. Avoid policy queries.`;
+	} else {
+		warning = `Context at ${percent.toFixed(0)}%. Consider wrapping up current delegation cycle.`;
+	}
+
+	return {
+		...result,
+		content: [...result.content, { type: "text" as const, text: warning }],
+	};
 }
 
 const TeamsActionSchema = StringEnum(
@@ -204,8 +231,9 @@ export function registerTeamsTool(opts: {
 	refreshTasks: () => Promise<void>;
 	renderWidget: () => void;
 	pendingPlanApprovals: Map<string, { requestId: string; name: string; taskId?: string }>;
+	getContextUsage: () => ContextUsage | undefined;
 }): void {
-	const { pi, teammates, spawnTeammate, getTeamId, getTaskListId, refreshTasks, renderWidget, pendingPlanApprovals } = opts;
+	const { pi, teammates, spawnTeammate, getTeamId, getTaskListId, refreshTasks, renderWidget, pendingPlanApprovals, getContextUsage } = opts;
 
 	pi.registerTool({
 		name: "teams",
@@ -221,865 +249,874 @@ export function registerTeamsTool(opts: {
 		parameters: TeamsToolParamsSchema,
 
 		async execute(_toolCallId, params: TeamsToolParamsType, signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
-			const action = params.action ?? "delegate";
-			const teamId = getTeamId(ctx);
-			const teamDir = getTeamDir(teamId);
-			const taskListId = getTaskListId();
-			const effectiveTlId = taskListId ?? teamId;
-			const cfg = await ensureTeamConfig(teamDir, {
-				teamId,
-				taskListId: effectiveTlId,
-				leadName: "team-lead",
-				style: getTeamsStyleFromEnv(),
+			const result = await executeTeamsAction(params, signal, ctx);
+			return appendContextWarning(result, getContextUsage());
+		},
+	});
+
+	async function executeTeamsAction(
+		params: TeamsToolParamsType,
+		signal: AbortSignal | undefined,
+		ctx: Parameters<SpawnTeammateFn>[0],
+	): Promise<AgentToolResult<unknown>> {
+		const action = params.action ?? "delegate";
+		const teamId = getTeamId(ctx);
+		const teamDir = getTeamDir(teamId);
+		const taskListId = getTaskListId();
+		const effectiveTlId = taskListId ?? teamId;
+		const cfg = await ensureTeamConfig(teamDir, {
+			teamId,
+			taskListId: effectiveTlId,
+			leadName: "team-lead",
+			style: getTeamsStyleFromEnv(),
+		});
+		const style: TeamsStyle = cfg.style ?? getTeamsStyleFromEnv();
+		const strings = getTeamsStrings(style);
+
+		const refreshUi = async (): Promise<void> => {
+			await refreshTasks();
+			renderWidget();
+		};
+
+		if (action === "task_set_status") {
+			const taskId = params.taskId?.trim();
+			const status = params.status;
+			if (!taskId || !status) {
+				return {
+					content: [{ type: "text", text: "task_set_status requires taskId and status" }],
+					details: { action, taskId, status },
+				};
+			}
+
+			const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
+				if (cur.status === status) return cur;
+				const metadata = { ...(cur.metadata ?? {}) };
+				if (status === "completed") metadata.completedAt = new Date().toISOString();
+				if (status !== "completed" && cur.status === "completed") metadata.reopenedAt = new Date().toISOString();
+				return { ...cur, status, metadata };
 			});
-			const style: TeamsStyle = cfg.style ?? getTeamsStyleFromEnv();
-			const strings = getTeamsStrings(style);
+			if (!updated) {
+				return {
+					content: [{ type: "text", text: `Task not found: ${taskId}` }],
+					details: { action, taskId, status },
+				};
+			}
 
-			const refreshUi = async (): Promise<void> => {
-				await refreshTasks();
-				renderWidget();
+			await refreshUi();
+			return {
+				content: [{ type: "text", text: `Updated task #${updated.id}: status=${updated.status}` }],
+				details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id, status: updated.status },
 			};
+		}
 
-			if (action === "task_set_status") {
-				const taskId = params.taskId?.trim();
-				const status = params.status;
-				if (!taskId || !status) {
-					return {
-						content: [{ type: "text", text: "task_set_status requires taskId and status" }],
-						details: { action, taskId, status },
-					};
-				}
-
-				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-					if (cur.status === status) return cur;
-					const metadata = { ...(cur.metadata ?? {}) };
-					if (status === "completed") metadata.completedAt = new Date().toISOString();
-					if (status !== "completed" && cur.status === "completed") metadata.reopenedAt = new Date().toISOString();
-					return { ...cur, status, metadata };
-				});
-				if (!updated) {
-					return {
-						content: [{ type: "text", text: `Task not found: ${taskId}` }],
-						details: { action, taskId, status },
-					};
-				}
-
-				await refreshUi();
+		if (action === "task_unassign") {
+			const taskId = params.taskId?.trim();
+			if (!taskId) {
 				return {
-					content: [{ type: "text", text: `Updated task #${updated.id}: status=${updated.status}` }],
-					details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id, status: updated.status },
-				};
-			}
-
-			if (action === "task_unassign") {
-				const taskId = params.taskId?.trim();
-				if (!taskId) {
-					return {
-						content: [{ type: "text", text: "task_unassign requires taskId" }],
-						details: { action },
-					};
-				}
-
-				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-					if (!cur.owner) return cur;
-					if (cur.status === "completed") return { ...cur, owner: undefined };
-					const metadata = { ...(cur.metadata ?? {}) };
-					metadata.unassignedAt = new Date().toISOString();
-					metadata.unassignedBy = cfg.leadName;
-					metadata.unassignedReason = "teams-tool";
-					return { ...cur, owner: undefined, status: "pending", metadata };
-				});
-				if (!updated) {
-					return {
-						content: [{ type: "text", text: `Task not found: ${taskId}` }],
-						details: { action, taskId },
-					};
-				}
-
-				await refreshUi();
-				return {
-					content: [{ type: "text", text: `Unassigned task #${updated.id}` }],
-					details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id },
-				};
-			}
-
-			if (action === "task_assign") {
-				const taskId = params.taskId?.trim();
-				const assignee = sanitizeName(params.assignee ?? "");
-				if (!taskId || !assignee) {
-					return {
-						content: [{ type: "text", text: "task_assign requires taskId and assignee" }],
-						details: { action, taskId, assignee: params.assignee },
-					};
-				}
-
-				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-					const metadata = { ...(cur.metadata ?? {}) };
-					metadata.reassignedAt = new Date().toISOString();
-					metadata.reassignedBy = cfg.leadName;
-					metadata.reassignedTo = assignee;
-					if (cur.status === "completed") return { ...cur, owner: assignee, metadata };
-					return { ...cur, owner: assignee, status: "pending", metadata };
-				});
-				if (!updated) {
-					return {
-						content: [{ type: "text", text: `Task not found: ${taskId}` }],
-						details: { action, taskId, assignee },
-					};
-				}
-
-				await writeToMailbox(teamDir, effectiveTlId, assignee, {
-					from: cfg.leadName,
-					text: JSON.stringify(taskAssignmentPayload(updated, cfg.leadName)),
-					timestamp: new Date().toISOString(),
-				});
-
-				await refreshUi();
-				return {
-					content: [{ type: "text", text: `Assigned task #${updated.id} to ${formatMemberDisplayName(style, assignee)}` }],
-					details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id, assignee },
-				};
-			}
-
-			if (action === "task_dep_add" || action === "task_dep_rm") {
-				const taskId = params.taskId?.trim();
-				const depId = params.depId?.trim();
-				if (!taskId || !depId) {
-					return {
-						content: [{ type: "text", text: `${action} requires taskId and depId` }],
-						details: { action, taskId, depId },
-					};
-				}
-
-				const res = action === "task_dep_add"
-					? await addTaskDependency(teamDir, effectiveTlId, taskId, depId)
-					: await removeTaskDependency(teamDir, effectiveTlId, taskId, depId);
-				if (!res.ok) {
-					return {
-						content: [{ type: "text", text: res.error }],
-						details: { action, taskId, depId, error: res.error },
-					};
-				}
-
-				await refreshUi();
-				return {
-					content: [{ type: "text", text: action === "task_dep_add" ? `Added dependency: #${taskId} depends on #${depId}` : `Removed dependency: #${taskId} no longer depends on #${depId}` }],
-					details: { action, teamId, taskListId: effectiveTlId, taskId, depId },
-				};
-			}
-
-			if (action === "task_dep_ls") {
-				const taskId = params.taskId?.trim();
-				if (!taskId) {
-					return {
-						content: [{ type: "text", text: "task_dep_ls requires taskId" }],
-						details: { action },
-					};
-				}
-
-				const task = await getTask(teamDir, effectiveTlId, taskId);
-				if (!task) {
-					return {
-						content: [{ type: "text", text: `Task not found: ${taskId}` }],
-						details: { action, taskId },
-					};
-				}
-				const blocked = task.status !== "completed" && (await isTaskBlocked(teamDir, effectiveTlId, task));
-				const all = await listTasks(teamDir, effectiveTlId);
-				const byId = new Map<string, (typeof all)[number]>();
-				for (const t of all) byId.set(t.id, t);
-
-				const lines: string[] = [];
-				lines.push(`#${task.id} ${task.subject}`);
-				lines.push(`${blocked ? "blocked" : "unblocked"} • deps:${task.blockedBy.length} • blocks:${task.blocks.length}`);
-				lines.push("");
-				const MAX_DEPS = 6;
-
-				lines.push("blockedBy:");
-				if (task.blockedBy.length === 0) {
-					lines.push("  (none)");
-				} else {
-					const depsToShow = task.blockedBy.slice(0, MAX_DEPS);
-					for (const id of depsToShow) {
-						const dep = byId.get(id) ?? (await getTask(teamDir, effectiveTlId, id));
-						lines.push(dep ? `  - #${id} ${dep.status} ${dep.subject}` : `  - #${id} (missing)`);
-					}
-					if (task.blockedBy.length > MAX_DEPS) {
-						lines.push(`  ... +${task.blockedBy.length - MAX_DEPS} more`);
-					}
-				}
-				lines.push("");
-				lines.push("blocks:");
-				if (task.blocks.length === 0) {
-					lines.push("  (none)");
-				} else {
-					const blocksToShow = task.blocks.slice(0, MAX_DEPS);
-					for (const id of blocksToShow) {
-						const child = byId.get(id) ?? (await getTask(teamDir, effectiveTlId, id));
-						lines.push(child ? `  - #${id} ${child.status} ${child.subject}` : `  - #${id} (missing)`);
-					}
-					if (task.blocks.length > MAX_DEPS) {
-						lines.push(`  ... +${task.blocks.length - MAX_DEPS} more`);
-					}
-				}
-
-				return {
-					content: [{ type: "text", text: lines.join("\n") }],
-					details: { action, teamId, taskListId: effectiveTlId, taskId, blocked },
-				};
-			}
-
-			if (action === "message_dm") {
-				const nameRaw = params.name?.trim();
-				const message = params.message?.trim();
-				if (!nameRaw || !message) {
-					return {
-						content: [{ type: "text", text: "message_dm requires name and message" }],
-						details: { action, name: nameRaw },
-					};
-				}
-				const name = sanitizeName(nameRaw);
-				await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-					from: cfg.leadName,
-					text: message,
-					timestamp: new Date().toISOString(),
-				});
-				return {
-					content: [{ type: "text", text: `DM queued for ${formatMemberDisplayName(style, name)}` }],
-					details: { action, teamId, name, mailboxNamespace: TEAM_MAILBOX_NS },
-				};
-			}
-
-			if (action === "message_broadcast") {
-				const message = params.message?.trim();
-				if (!message) {
-					return {
-						content: [{ type: "text", text: "message_broadcast requires message" }],
-						details: { action },
-					};
-				}
-				const recipients = new Set<string>();
-				for (const m of cfg.members) {
-					if (m.role === "worker") recipients.add(m.name);
-				}
-				for (const name of teammates.keys()) recipients.add(name);
-				const allTasks = await listTasks(teamDir, effectiveTlId);
-				for (const t of allTasks) {
-					if (t.owner && t.owner !== cfg.leadName) recipients.add(t.owner);
-				}
-				const names = Array.from(recipients).sort();
-				if (names.length === 0) {
-					return compactResult(`No ${strings.memberTitle.toLowerCase()}s to broadcast to`, { action, recipients: [] });
-				}
-				const ts = new Date().toISOString();
-				await Promise.all(
-					names.map((name) =>
-						writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-							from: cfg.leadName,
-							text: message,
-							timestamp: ts,
-						}),
-					),
-				);
-				return compactResult(
-					`Broadcast queued for ${summarizeNameList(names, style, strings.memberTitle.toLowerCase())}`,
-					{ action, teamId, recipients: names, mailboxNamespace: TEAM_MAILBOX_NS },
-				);
-			}
-
-			if (action === "message_steer") {
-				const nameRaw = params.name?.trim();
-				const message = params.message?.trim();
-				if (!nameRaw || !message) {
-					return {
-						content: [{ type: "text", text: "message_steer requires name and message" }],
-						details: { action, name: nameRaw },
-					};
-				}
-				const name = sanitizeName(nameRaw);
-				const rpc = teammates.get(name);
-				if (!rpc) {
-					return {
-						content: [{ type: "text", text: `Unknown ${strings.memberTitle.toLowerCase()}: ${name}` }],
-						details: { action, name },
-					};
-				}
-				await rpc.steer(message);
-				renderWidget();
-				return {
-					content: [{ type: "text", text: `Steering sent to ${formatMemberDisplayName(style, name)}` }],
-					details: { action, teamId, name },
-				};
-			}
-
-			if (action === "member_spawn") {
-				const nameRaw = params.name?.trim();
-				const name = sanitizeName(nameRaw ?? "");
-				if (!name) {
-					return {
-						content: [{ type: "text", text: "member_spawn requires name" }],
-						details: { action, name: nameRaw },
-					};
-				}
-				if (teammates.has(name)) {
-					return {
-						content: [{ type: "text", text: `${formatMemberDisplayName(style, name)} is already running` }],
-						details: { action, teamId, name, alreadyRunning: true },
-					};
-				}
-
-				const contextMode: ContextMode = params.contextMode === "branch" ? "branch" : "fresh";
-				const workspaceMode: WorkspaceMode = params.workspaceMode === "worktree" ? "worktree" : "shared";
-				const modelOverride = params.model?.trim();
-				const spawnModel = modelOverride && modelOverride.length > 0 ? modelOverride : undefined;
-				const res = await spawnTeammate(ctx, {
-					name,
-					mode: contextMode,
-					workspaceMode,
-					model: spawnModel,
-					thinking: params.thinking,
-					planRequired: params.planRequired === true,
-				});
-
-				if (!res.ok) {
-					return {
-						content: [{ type: "text", text: `Failed to spawn ${formatMemberDisplayName(style, name)}: ${res.error}` }],
-						details: { action, teamId, name, error: res.error },
-					};
-				}
-
-				await refreshUi();
-				const lines: string[] = [
-					`Spawned ${formatMemberDisplayName(style, res.name)} (${res.mode}/${res.workspaceMode})`,
-				];
-				if (res.note) lines.push(`note: ${res.note}`);
-				for (const w of res.warnings) lines.push(`warning: ${w}`);
-				return {
-					content: [{ type: "text", text: lines.join("\n") }],
-					details: { action, teamId, name: res.name, mode: res.mode, workspaceMode: res.workspaceMode, warnings: res.warnings },
-				};
-			}
-
-			if (action === "member_kill") {
-				const nameRaw = params.name?.trim();
-				const name = sanitizeName(nameRaw ?? "");
-				if (!name) {
-					return {
-						content: [{ type: "text", text: "member_kill requires name" }],
-						details: { action, name: nameRaw },
-					};
-				}
-				const rpc = teammates.get(name);
-				if (!rpc) {
-					return {
-						content: [{ type: "text", text: `Unknown ${strings.memberTitle.toLowerCase()}: ${name}` }],
-						details: { action, name },
-					};
-				}
-
-				await rpc.stop();
-				teammates.delete(name);
-				await unassignTasksForAgent(teamDir, effectiveTlId, name, `${formatMemberDisplayName(style, name)} ${strings.killedVerb}`);
-				await setMemberStatus(teamDir, name, "offline", { meta: { killedAt: new Date().toISOString() } });
-				await refreshUi();
-				return {
-					content: [{ type: "text", text: `${formatMemberDisplayName(style, name)} ${strings.killedVerb} (SIGTERM)` }],
-					details: { action, teamId, name },
-				};
-			}
-
-			if (action === "member_shutdown") {
-				const reason = params.reason?.trim();
-				const all = params.all === true;
-				const explicitName = sanitizeName(params.name?.trim() ?? "");
-				if (!all && !explicitName) {
-					return {
-						content: [{ type: "text", text: "member_shutdown requires name (or all=true)" }],
-						details: { action },
-					};
-				}
-
-				const recipients = new Set<string>();
-				if (all) {
-					for (const m of cfg.members) {
-						if (m.role === "worker" && m.status === "online") recipients.add(m.name);
-					}
-					for (const name of teammates.keys()) recipients.add(name);
-				} else if (explicitName) {
-					recipients.add(explicitName);
-				}
-
-				const names = Array.from(recipients).sort();
-				if (names.length === 0) {
-					return compactResult(`No ${strings.memberTitle.toLowerCase()}s to shut down`, { action, all, recipients: [] });
-				}
-
-				const ts = new Date().toISOString();
-				for (const name of names) {
-					const requestId = randomUUID();
-					await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-						from: cfg.leadName,
-						text: JSON.stringify({
-							type: "shutdown_request",
-							requestId,
-							from: cfg.leadName,
-							timestamp: ts,
-							...(reason ? { reason } : {}),
-						}),
-						timestamp: ts,
-					});
-					await setMemberStatus(teamDir, name, "online", {
-						meta: {
-							shutdownRequestedAt: ts,
-							shutdownRequestId: requestId,
-							...(reason ? { shutdownReason: reason } : {}),
-						},
-					});
-				}
-
-				await refreshUi();
-				return compactResult(
-					`Shutdown requested for ${summarizeNameList(names, style, strings.memberTitle.toLowerCase())}`,
-					{ action, teamId, names, all, reason },
-				);
-			}
-
-			if (action === "member_prune") {
-				const all = params.all === true;
-				const workers = cfg.members.filter((m) => m.role === "worker");
-				if (workers.length === 0) {
-					return compactResult(`No ${strings.memberTitle.toLowerCase()}s to prune`, { action, teamId, pruned: [] });
-				}
-
-				const tasks = await listTasks(teamDir, effectiveTlId);
-				const inProgressOwners = new Set<string>();
-				for (const t of tasks) {
-					if (t.owner && t.status === "in_progress") inProgressOwners.add(t.owner);
-				}
-
-				const cutoffMs = 60 * 60 * 1000;
-				const now = Date.now();
-				const pruned: string[] = [];
-				for (const m of workers) {
-					if (teammates.has(m.name)) continue;
-					if (inProgressOwners.has(m.name)) continue;
-					if (!all) {
-						const lastSeen = m.lastSeenAt ? Date.parse(m.lastSeenAt) : Number.NaN;
-						if (!Number.isFinite(lastSeen)) continue;
-						if (now - lastSeen < cutoffMs) continue;
-					}
-					await setMemberStatus(teamDir, m.name, "offline", {
-						meta: { prunedAt: new Date().toISOString(), prunedBy: "teams-tool" },
-					});
-					pruned.push(m.name);
-				}
-
-				await refreshUi();
-				if (pruned.length === 0) {
-					return compactResult(
-						`No stale ${strings.memberTitle.toLowerCase()}s to prune${all ? "" : " (use all=true to force)"}`,
-						{ action, teamId, pruned },
-					);
-				}
-				return compactResult(
-					`Pruned ${summarizeNameList(pruned, style, `stale ${strings.memberTitle.toLowerCase()}`)}`,
-					{ action, teamId, pruned },
-				);
-			}
-
-			if (action === "plan_approve") {
-				const nameRaw = params.name?.trim();
-				const name = sanitizeName(nameRaw ?? "");
-				if (!name) {
-					return {
-						content: [{ type: "text", text: "plan_approve requires name" }],
-						details: { action, name: nameRaw },
-					};
-				}
-				const pending = pendingPlanApprovals.get(name);
-				if (!pending) {
-					return {
-						content: [{ type: "text", text: `No pending plan approval for ${name}` }],
-						details: { action, name },
-					};
-				}
-				const ts = new Date().toISOString();
-				await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-					from: cfg.leadName,
-					text: JSON.stringify({
-						type: "plan_approved",
-						requestId: pending.requestId,
-						from: cfg.leadName,
-						timestamp: ts,
-					}),
-					timestamp: ts,
-				});
-				pendingPlanApprovals.delete(name);
-				return {
-					content: [{ type: "text", text: `Approved plan for ${formatMemberDisplayName(style, name)}` }],
-					details: { action, teamId, name, requestId: pending.requestId, taskId: pending.taskId },
-				};
-			}
-
-			if (action === "plan_reject") {
-				const nameRaw = params.name?.trim();
-				const name = sanitizeName(nameRaw ?? "");
-				if (!name) {
-					return {
-						content: [{ type: "text", text: "plan_reject requires name" }],
-						details: { action, name: nameRaw },
-					};
-				}
-				const pending = pendingPlanApprovals.get(name);
-				if (!pending) {
-					return {
-						content: [{ type: "text", text: `No pending plan approval for ${name}` }],
-						details: { action, name },
-					};
-				}
-				const feedback = params.feedback?.trim() || params.reason?.trim() || "Plan rejected";
-				const ts = new Date().toISOString();
-				await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-					from: cfg.leadName,
-					text: JSON.stringify({
-						type: "plan_rejected",
-						requestId: pending.requestId,
-						from: cfg.leadName,
-						feedback,
-						timestamp: ts,
-					}),
-					timestamp: ts,
-				});
-				pendingPlanApprovals.delete(name);
-				return {
-					content: [{ type: "text", text: `Rejected plan for ${formatMemberDisplayName(style, name)}: ${feedback}` }],
-					details: { action, teamId, name, requestId: pending.requestId, taskId: pending.taskId, feedback },
-				};
-			}
-
-			if (action === "model_policy_get") {
-				const leaderProvider = ctx.model?.provider;
-				const leaderModelId = ctx.model?.id;
-				const leaderModel = formatProviderModel(leaderProvider, leaderModelId);
-				const leaderModelDeprecated = leaderModelId ? isDeprecatedTeammateModelId(leaderModelId) : false;
-				const resolved = resolveTeammateModelSelection({
-					leaderProvider,
-					leaderModelId,
-				});
-				if (!resolved.ok) {
-					return compactResult(`Model policy resolution failed: ${resolved.error}`, {
-						action,
-						teamId,
-						error: resolved.error,
-						reason: resolved.reason,
-					});
-				}
-
-				const effectiveModel = formatProviderModel(resolved.value.provider, resolved.value.modelId);
-
-				return compactResult(
-					`Model policy: leader=${leaderModel ?? "(unknown)"}${leaderModelDeprecated ? " (deprecated)" : ""}, teammate default=${effectiveModel ?? "(inherit leader)"} (source=${describeModelSource(resolved.value.source)}). Override: '<provider>/<modelId>'.`,
-					{
-						action,
-						teamId,
-						deprecatedPolicy: {
-							family: "claude-sonnet-4",
-							allowedExceptions: ["claude-sonnet-4-5", "claude-sonnet-4.5"],
-						},
-						leader: {
-							provider: leaderProvider,
-							modelId: leaderModelId,
-							model: leaderModel,
-							deprecated: leaderModelDeprecated,
-						},
-						defaultSelection: {
-							source: resolved.value.source,
-							provider: resolved.value.provider,
-							modelId: resolved.value.modelId,
-							model: effectiveModel,
-							warnings: resolved.value.warnings,
-						},
-					},
-				);
-			}
-
-			if (action === "model_policy_check") {
-				const modelInput = params.model?.trim();
-				const resolved = resolveTeammateModelSelection({
-					modelOverride: modelInput,
-					leaderProvider: ctx.model?.provider,
-					leaderModelId: ctx.model?.id,
-				});
-
-				if (!resolved.ok) {
-					return compactResult(
-						`Model check rejected: ${modelInput ?? "(none)"} — ${resolved.error}`,
-						{
-							action,
-							teamId,
-							accepted: false,
-							input: modelInput,
-							error: resolved.error,
-							reason: resolved.reason,
-						},
-					);
-				}
-
-				const resolvedModel = formatProviderModel(resolved.value.provider, resolved.value.modelId);
-				const warnSuffix = resolved.value.warnings.length > 0 ? ` [${resolved.value.warnings.join("; ")}]` : "";
-				return compactResult(
-					`Model check accepted: ${modelInput ?? "(none)"} → ${resolvedModel ?? "(teammate default)"} (${describeModelSource(resolved.value.source)})${warnSuffix}`,
-					{
-						action,
-						teamId,
-						accepted: true,
-						input: modelInput,
-						source: resolved.value.source,
-						provider: resolved.value.provider,
-						modelId: resolved.value.modelId,
-						model: resolvedModel,
-						warnings: resolved.value.warnings,
-					},
-				);
-			}
-
-			if (action === "hooks_policy_get") {
-				const configuredFailureAction: TeamsHookFailureAction | undefined = cfg.hooks?.failureAction;
-				const configuredFollowupOwner: TeamsHookFollowupOwnerPolicy | undefined = cfg.hooks?.followupOwner;
-				const configuredMaxReopens = cfg.hooks?.maxReopensPerTask;
-
-				const effectiveFailureAction = getTeamsHookFailureAction(process.env, configuredFailureAction);
-				const effectiveFollowupOwner = getTeamsHookFollowupOwnerPolicy(process.env, configuredFollowupOwner);
-				const effectiveMaxReopens = getTeamsHookMaxReopensPerTask(process.env, configuredMaxReopens);
-
-				const overrides: string[] = [];
-				if (configuredFailureAction) overrides.push("failureAction");
-				if (configuredMaxReopens !== undefined) overrides.push("maxReopensPerTask");
-				if (configuredFollowupOwner) overrides.push("followupOwner");
-				const overrideSuffix = overrides.length > 0 ? ` (team overrides: ${overrides.join(", ")})` : " (all env defaults)";
-
-				return compactResult(
-					`Hooks: failureAction=${effectiveFailureAction}, maxReopens=${String(effectiveMaxReopens)}, followupOwner=${effectiveFollowupOwner}${overrideSuffix}`,
-					{
-						action,
-						teamId,
-						configured: {
-							failureAction: configuredFailureAction,
-							maxReopensPerTask: configuredMaxReopens,
-							followupOwner: configuredFollowupOwner,
-						},
-						effective: {
-							failureAction: effectiveFailureAction,
-							maxReopensPerTask: effectiveMaxReopens,
-							followupOwner: effectiveFollowupOwner,
-						},
-					},
-				);
-			}
-
-			if (action === "hooks_policy_set") {
-				const reset = params.hooksPolicyReset === true;
-				const nextFailureAction = params.hookFailureAction;
-				const nextMaxReopens = params.hookMaxReopensPerTask;
-				const nextFollowupOwner = params.hookFollowupOwner;
-				if (!reset && nextFailureAction === undefined && nextMaxReopens === undefined && nextFollowupOwner === undefined) {
-					return {
-						content: [
-							{
-								type: "text",
-								text: "hooks_policy_set requires at least one policy field (or hooksPolicyReset=true)",
-							},
-						],
-						details: { action, reset },
-					};
-				}
-
-				const updatedCfg = await updateTeamHooksPolicy(teamDir, (current) => {
-					const next = reset ? {} : { ...current };
-					if (nextFailureAction !== undefined) next.failureAction = nextFailureAction;
-					if (nextMaxReopens !== undefined) next.maxReopensPerTask = nextMaxReopens;
-					if (nextFollowupOwner !== undefined) next.followupOwner = nextFollowupOwner;
-					if (
-						next.failureAction === undefined &&
-						next.maxReopensPerTask === undefined &&
-						next.followupOwner === undefined
-					) {
-						return undefined;
-					}
-					return next;
-				});
-				if (!updatedCfg) {
-					return {
-						content: [{ type: "text", text: "Failed to update hooks policy: team config missing" }],
-						details: { action, teamId },
-					};
-				}
-
-				await refreshUi();
-				const configuredFailureAction: TeamsHookFailureAction | undefined = updatedCfg.hooks?.failureAction;
-				const configuredFollowupOwner: TeamsHookFollowupOwnerPolicy | undefined = updatedCfg.hooks?.followupOwner;
-				const configuredMaxReopens = updatedCfg.hooks?.maxReopensPerTask;
-				const effectiveFailureAction = getTeamsHookFailureAction(process.env, configuredFailureAction);
-				const effectiveFollowupOwner = getTeamsHookFollowupOwnerPolicy(process.env, configuredFollowupOwner);
-				const effectiveMaxReopens = getTeamsHookMaxReopensPerTask(process.env, configuredMaxReopens);
-
-				return compactResult(
-					`Updated hooks: failureAction=${effectiveFailureAction}, maxReopens=${String(effectiveMaxReopens)}, followupOwner=${effectiveFollowupOwner}`,
-					{
-						action,
-						teamId,
-						reset,
-						configured: {
-							failureAction: configuredFailureAction,
-							maxReopensPerTask: configuredMaxReopens,
-							followupOwner: configuredFollowupOwner,
-						},
-						effective: {
-							failureAction: effectiveFailureAction,
-							maxReopensPerTask: effectiveMaxReopens,
-							followupOwner: effectiveFollowupOwner,
-						},
-					},
-				);
-			}
-
-			if (action !== "delegate") {
-				return {
-					content: [{ type: "text", text: `Unsupported action: ${String(action)}` }],
+					content: [{ type: "text", text: "task_unassign requires taskId" }],
 					details: { action },
 				};
 			}
 
-			const inputTasks: TeamsToolDelegateTask[] = params.tasks ?? [];
-			if (inputTasks.length === 0) {
+			const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
+				if (!cur.owner) return cur;
+				if (cur.status === "completed") return { ...cur, owner: undefined };
+				const metadata = { ...(cur.metadata ?? {}) };
+				metadata.unassignedAt = new Date().toISOString();
+				metadata.unassignedBy = cfg.leadName;
+				metadata.unassignedReason = "teams-tool";
+				return { ...cur, owner: undefined, status: "pending", metadata };
+			});
+			if (!updated) {
 				return {
-					content: [{ type: "text", text: "No tasks provided. Provide tasks: [{text, assignee?}, ...]" }],
+					content: [{ type: "text", text: `Task not found: ${taskId}` }],
+					details: { action, taskId },
+				};
+			}
+
+			await refreshUi();
+			return {
+				content: [{ type: "text", text: `Unassigned task #${updated.id}` }],
+				details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id },
+			};
+		}
+
+		if (action === "task_assign") {
+			const taskId = params.taskId?.trim();
+			const assignee = sanitizeName(params.assignee ?? "");
+			if (!taskId || !assignee) {
+				return {
+					content: [{ type: "text", text: "task_assign requires taskId and assignee" }],
+					details: { action, taskId, assignee: params.assignee },
+				};
+			}
+
+			const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
+				const metadata = { ...(cur.metadata ?? {}) };
+				metadata.reassignedAt = new Date().toISOString();
+				metadata.reassignedBy = cfg.leadName;
+				metadata.reassignedTo = assignee;
+				if (cur.status === "completed") return { ...cur, owner: assignee, metadata };
+				return { ...cur, owner: assignee, status: "pending", metadata };
+			});
+			if (!updated) {
+				return {
+					content: [{ type: "text", text: `Task not found: ${taskId}` }],
+					details: { action, taskId, assignee },
+				};
+			}
+
+			await writeToMailbox(teamDir, effectiveTlId, assignee, {
+				from: cfg.leadName,
+				text: JSON.stringify(taskAssignmentPayload(updated, cfg.leadName)),
+				timestamp: new Date().toISOString(),
+			});
+
+			await refreshUi();
+			return {
+				content: [{ type: "text", text: `Assigned task #${updated.id} to ${formatMemberDisplayName(style, assignee)}` }],
+				details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id, assignee },
+			};
+		}
+
+		if (action === "task_dep_add" || action === "task_dep_rm") {
+			const taskId = params.taskId?.trim();
+			const depId = params.depId?.trim();
+			if (!taskId || !depId) {
+				return {
+					content: [{ type: "text", text: `${action} requires taskId and depId` }],
+					details: { action, taskId, depId },
+				};
+			}
+
+			const res = action === "task_dep_add"
+				? await addTaskDependency(teamDir, effectiveTlId, taskId, depId)
+				: await removeTaskDependency(teamDir, effectiveTlId, taskId, depId);
+			if (!res.ok) {
+				return {
+					content: [{ type: "text", text: res.error }],
+					details: { action, taskId, depId, error: res.error },
+				};
+			}
+
+			await refreshUi();
+			return {
+				content: [{ type: "text", text: action === "task_dep_add" ? `Added dependency: #${taskId} depends on #${depId}` : `Removed dependency: #${taskId} no longer depends on #${depId}` }],
+				details: { action, teamId, taskListId: effectiveTlId, taskId, depId },
+			};
+		}
+
+		if (action === "task_dep_ls") {
+			const taskId = params.taskId?.trim();
+			if (!taskId) {
+				return {
+					content: [{ type: "text", text: "task_dep_ls requires taskId" }],
 					details: { action },
+				};
+			}
+
+			const task = await getTask(teamDir, effectiveTlId, taskId);
+			if (!task) {
+				return {
+					content: [{ type: "text", text: `Task not found: ${taskId}` }],
+					details: { action, taskId },
+				};
+			}
+			const blocked = task.status !== "completed" && (await isTaskBlocked(teamDir, effectiveTlId, task));
+			const all = await listTasks(teamDir, effectiveTlId);
+			const byId = new Map<string, (typeof all)[number]>();
+			for (const t of all) byId.set(t.id, t);
+
+			const lines: string[] = [];
+			lines.push(`#${task.id} ${task.subject}`);
+			lines.push(`${blocked ? "blocked" : "unblocked"} • deps:${task.blockedBy.length} • blocks:${task.blocks.length}`);
+			lines.push("");
+			const MAX_DEPS = 6;
+
+			lines.push("blockedBy:");
+			if (task.blockedBy.length === 0) {
+				lines.push("  (none)");
+			} else {
+				const depsToShow = task.blockedBy.slice(0, MAX_DEPS);
+				for (const id of depsToShow) {
+					const dep = byId.get(id) ?? (await getTask(teamDir, effectiveTlId, id));
+					lines.push(dep ? `  - #${id} ${dep.status} ${dep.subject}` : `  - #${id} (missing)`);
+				}
+				if (task.blockedBy.length > MAX_DEPS) {
+					lines.push(`  ... +${task.blockedBy.length - MAX_DEPS} more`);
+				}
+			}
+			lines.push("");
+			lines.push("blocks:");
+			if (task.blocks.length === 0) {
+				lines.push("  (none)");
+			} else {
+				const blocksToShow = task.blocks.slice(0, MAX_DEPS);
+				for (const id of blocksToShow) {
+					const child = byId.get(id) ?? (await getTask(teamDir, effectiveTlId, id));
+					lines.push(child ? `  - #${id} ${child.status} ${child.subject}` : `  - #${id} (missing)`);
+				}
+				if (task.blocks.length > MAX_DEPS) {
+					lines.push(`  ... +${task.blocks.length - MAX_DEPS} more`);
+				}
+			}
+
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { action, teamId, taskListId: effectiveTlId, taskId, blocked },
+			};
+		}
+
+		if (action === "message_dm") {
+			const nameRaw = params.name?.trim();
+			const message = params.message?.trim();
+			if (!nameRaw || !message) {
+				return {
+					content: [{ type: "text", text: "message_dm requires name and message" }],
+					details: { action, name: nameRaw },
+				};
+			}
+			const name = sanitizeName(nameRaw);
+			await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
+				from: cfg.leadName,
+				text: message,
+				timestamp: new Date().toISOString(),
+			});
+			return {
+				content: [{ type: "text", text: `DM queued for ${formatMemberDisplayName(style, name)}` }],
+				details: { action, teamId, name, mailboxNamespace: TEAM_MAILBOX_NS },
+			};
+		}
+
+		if (action === "message_broadcast") {
+			const message = params.message?.trim();
+			if (!message) {
+				return {
+					content: [{ type: "text", text: "message_broadcast requires message" }],
+					details: { action },
+				};
+			}
+			const recipients = new Set<string>();
+			for (const m of cfg.members) {
+				if (m.role === "worker") recipients.add(m.name);
+			}
+			for (const name of teammates.keys()) recipients.add(name);
+			const allTasks = await listTasks(teamDir, effectiveTlId);
+			for (const t of allTasks) {
+				if (t.owner && t.owner !== cfg.leadName) recipients.add(t.owner);
+			}
+			const names = Array.from(recipients).sort();
+			if (names.length === 0) {
+				return compactResult(`No ${strings.memberTitle.toLowerCase()}s to broadcast to`, { action, recipients: [] });
+			}
+			const ts = new Date().toISOString();
+			await Promise.all(
+				names.map((name) =>
+					writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
+						from: cfg.leadName,
+						text: message,
+						timestamp: ts,
+					}),
+				),
+			);
+			return compactResult(
+				`Broadcast queued for ${summarizeNameList(names, style, strings.memberTitle.toLowerCase())}`,
+				{ action, teamId, recipients: names, mailboxNamespace: TEAM_MAILBOX_NS },
+			);
+		}
+
+		if (action === "message_steer") {
+			const nameRaw = params.name?.trim();
+			const message = params.message?.trim();
+			if (!nameRaw || !message) {
+				return {
+					content: [{ type: "text", text: "message_steer requires name and message" }],
+					details: { action, name: nameRaw },
+				};
+			}
+			const name = sanitizeName(nameRaw);
+			const rpc = teammates.get(name);
+			if (!rpc) {
+				return {
+					content: [{ type: "text", text: `Unknown ${strings.memberTitle.toLowerCase()}: ${name}` }],
+					details: { action, name },
+				};
+			}
+			await rpc.steer(message);
+			renderWidget();
+			return {
+				content: [{ type: "text", text: `Steering sent to ${formatMemberDisplayName(style, name)}` }],
+				details: { action, teamId, name },
+			};
+		}
+
+		if (action === "member_spawn") {
+			const nameRaw = params.name?.trim();
+			const name = sanitizeName(nameRaw ?? "");
+			if (!name) {
+				return {
+					content: [{ type: "text", text: "member_spawn requires name" }],
+					details: { action, name: nameRaw },
+				};
+			}
+			if (teammates.has(name)) {
+				return {
+					content: [{ type: "text", text: `${formatMemberDisplayName(style, name)} is already running` }],
+					details: { action, teamId, name, alreadyRunning: true },
 				};
 			}
 
 			const contextMode: ContextMode = params.contextMode === "branch" ? "branch" : "fresh";
-			const requestedWorkspaceMode: WorkspaceMode = params.workspaceMode === "worktree" ? "worktree" : "shared";
+			const workspaceMode: WorkspaceMode = params.workspaceMode === "worktree" ? "worktree" : "shared";
 			const modelOverride = params.model?.trim();
 			const spawnModel = modelOverride && modelOverride.length > 0 ? modelOverride : undefined;
-			const spawnThinking = params.thinking;
+			const res = await spawnTeammate(ctx, {
+				name,
+				mode: contextMode,
+				workspaceMode,
+				model: spawnModel,
+				thinking: params.thinking,
+				planRequired: params.planRequired === true,
+			});
 
-			let teammateNames: string[] = [];
-			const explicit = params.teammates;
-			if (explicit && explicit.length) {
-				teammateNames = explicit.map((n) => sanitizeName(n)).filter((n) => n.length > 0);
+			if (!res.ok) {
+				return {
+					content: [{ type: "text", text: `Failed to spawn ${formatMemberDisplayName(style, name)}: ${res.error}` }],
+					details: { action, teamId, name, error: res.error },
+				};
 			}
 
-			if (teammateNames.length === 0 && teammates.size > 0) {
-				teammateNames = Array.from(teammates.keys());
+			await refreshUi();
+			const lines: string[] = [
+				`Spawned ${formatMemberDisplayName(style, res.name)} (${res.mode}/${res.workspaceMode})`,
+			];
+			if (res.note) lines.push(`note: ${res.note}`);
+			for (const w of res.warnings) lines.push(`warning: ${w}`);
+			return {
+				content: [{ type: "text", text: lines.join("\n") }],
+				details: { action, teamId, name: res.name, mode: res.mode, workspaceMode: res.workspaceMode, warnings: res.warnings },
+			};
+		}
+
+		if (action === "member_kill") {
+			const nameRaw = params.name?.trim();
+			const name = sanitizeName(nameRaw ?? "");
+			if (!name) {
+				return {
+					content: [{ type: "text", text: "member_kill requires name" }],
+					details: { action, name: nameRaw },
+				};
+			}
+			const rpc = teammates.get(name);
+			if (!rpc) {
+				return {
+					content: [{ type: "text", text: `Unknown ${strings.memberTitle.toLowerCase()}: ${name}` }],
+					details: { action, name },
+				};
 			}
 
-			if (teammateNames.length === 0) {
-				const maxTeammates = Math.max(1, Math.min(16, params.maxTeammates ?? 4));
-				const count = Math.min(maxTeammates, inputTasks.length);
-				const taken = new Set(teammates.keys());
-				const naming = getTeamsNamingRules(style);
-				teammateNames =
-					naming.autoNameStrategy.kind === "agent"
-						? pickAgentNames(count, taken)
-						: pickNamesFromPool({
-							pool: naming.autoNameStrategy.pool,
-							count,
-							taken,
-							fallbackBase: naming.autoNameStrategy.fallbackBase,
-						});
+			await rpc.stop();
+			teammates.delete(name);
+			await unassignTasksForAgent(teamDir, effectiveTlId, name, `${formatMemberDisplayName(style, name)} ${strings.killedVerb}`);
+			await setMemberStatus(teamDir, name, "offline", { meta: { killedAt: new Date().toISOString() } });
+			await refreshUi();
+			return {
+				content: [{ type: "text", text: `${formatMemberDisplayName(style, name)} ${strings.killedVerb} (SIGTERM)` }],
+				details: { action, teamId, name },
+			};
+		}
+
+		if (action === "member_shutdown") {
+			const reason = params.reason?.trim();
+			const all = params.all === true;
+			const explicitName = sanitizeName(params.name?.trim() ?? "");
+			if (!all && !explicitName) {
+				return {
+					content: [{ type: "text", text: "member_shutdown requires name (or all=true)" }],
+					details: { action },
+				};
 			}
 
-			const spawned: string[] = [];
-			const warnings: string[] = [];
+			const recipients = new Set<string>();
+			if (all) {
+				for (const m of cfg.members) {
+					if (m.role === "worker" && m.status === "online") recipients.add(m.name);
+				}
+				for (const name of teammates.keys()) recipients.add(name);
+			} else if (explicitName) {
+				recipients.add(explicitName);
+			}
 
-			for (const name of teammateNames) {
-				if (signal?.aborted) break;
-				if (teammates.has(name)) continue;
+			const names = Array.from(recipients).sort();
+			if (names.length === 0) {
+				return compactResult(`No ${strings.memberTitle.toLowerCase()}s to shut down`, { action, all, recipients: [] });
+			}
+
+			const ts = new Date().toISOString();
+			for (const name of names) {
+				const requestId = randomUUID();
+				await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
+					from: cfg.leadName,
+					text: JSON.stringify({
+						type: "shutdown_request",
+						requestId,
+						from: cfg.leadName,
+						timestamp: ts,
+						...(reason ? { reason } : {}),
+					}),
+					timestamp: ts,
+				});
+				await setMemberStatus(teamDir, name, "online", {
+					meta: {
+						shutdownRequestedAt: ts,
+						shutdownRequestId: requestId,
+						...(reason ? { shutdownReason: reason } : {}),
+					},
+				});
+			}
+
+			await refreshUi();
+			return compactResult(
+				`Shutdown requested for ${summarizeNameList(names, style, strings.memberTitle.toLowerCase())}`,
+				{ action, teamId, names, all, reason },
+			);
+		}
+
+		if (action === "member_prune") {
+			const all = params.all === true;
+			const workers = cfg.members.filter((m) => m.role === "worker");
+			if (workers.length === 0) {
+				return compactResult(`No ${strings.memberTitle.toLowerCase()}s to prune`, { action, teamId, pruned: [] });
+			}
+
+			const tasks = await listTasks(teamDir, effectiveTlId);
+			const inProgressOwners = new Set<string>();
+			for (const t of tasks) {
+				if (t.owner && t.status === "in_progress") inProgressOwners.add(t.owner);
+			}
+
+			const cutoffMs = 60 * 60 * 1000;
+			const now = Date.now();
+			const pruned: string[] = [];
+			for (const m of workers) {
+				if (teammates.has(m.name)) continue;
+				if (inProgressOwners.has(m.name)) continue;
+				if (!all) {
+					const lastSeen = m.lastSeenAt ? Date.parse(m.lastSeenAt) : Number.NaN;
+					if (!Number.isFinite(lastSeen)) continue;
+					if (now - lastSeen < cutoffMs) continue;
+				}
+				await setMemberStatus(teamDir, m.name, "offline", {
+					meta: { prunedAt: new Date().toISOString(), prunedBy: "teams-tool" },
+				});
+				pruned.push(m.name);
+			}
+
+			await refreshUi();
+			if (pruned.length === 0) {
+				return compactResult(
+					`No stale ${strings.memberTitle.toLowerCase()}s to prune${all ? "" : " (use all=true to force)"}`,
+					{ action, teamId, pruned },
+				);
+			}
+			return compactResult(
+				`Pruned ${summarizeNameList(pruned, style, `stale ${strings.memberTitle.toLowerCase()}`)}`,
+				{ action, teamId, pruned },
+			);
+		}
+
+		if (action === "plan_approve") {
+			const nameRaw = params.name?.trim();
+			const name = sanitizeName(nameRaw ?? "");
+			if (!name) {
+				return {
+					content: [{ type: "text", text: "plan_approve requires name" }],
+					details: { action, name: nameRaw },
+				};
+			}
+			const pending = pendingPlanApprovals.get(name);
+			if (!pending) {
+				return {
+					content: [{ type: "text", text: `No pending plan approval for ${name}` }],
+					details: { action, name },
+				};
+			}
+			const ts = new Date().toISOString();
+			await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
+				from: cfg.leadName,
+				text: JSON.stringify({
+					type: "plan_approved",
+					requestId: pending.requestId,
+					from: cfg.leadName,
+					timestamp: ts,
+				}),
+				timestamp: ts,
+			});
+			pendingPlanApprovals.delete(name);
+			return {
+				content: [{ type: "text", text: `Approved plan for ${formatMemberDisplayName(style, name)}` }],
+				details: { action, teamId, name, requestId: pending.requestId, taskId: pending.taskId },
+			};
+		}
+
+		if (action === "plan_reject") {
+			const nameRaw = params.name?.trim();
+			const name = sanitizeName(nameRaw ?? "");
+			if (!name) {
+				return {
+					content: [{ type: "text", text: "plan_reject requires name" }],
+					details: { action, name: nameRaw },
+				};
+			}
+			const pending = pendingPlanApprovals.get(name);
+			if (!pending) {
+				return {
+					content: [{ type: "text", text: `No pending plan approval for ${name}` }],
+					details: { action, name },
+				};
+			}
+			const feedback = params.feedback?.trim() || params.reason?.trim() || "Plan rejected";
+			const ts = new Date().toISOString();
+			await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
+				from: cfg.leadName,
+				text: JSON.stringify({
+					type: "plan_rejected",
+					requestId: pending.requestId,
+					from: cfg.leadName,
+					feedback,
+					timestamp: ts,
+				}),
+				timestamp: ts,
+			});
+			pendingPlanApprovals.delete(name);
+			return {
+				content: [{ type: "text", text: `Rejected plan for ${formatMemberDisplayName(style, name)}: ${feedback}` }],
+				details: { action, teamId, name, requestId: pending.requestId, taskId: pending.taskId, feedback },
+			};
+		}
+
+		if (action === "model_policy_get") {
+			const leaderProvider = ctx.model?.provider;
+			const leaderModelId = ctx.model?.id;
+			const leaderModel = formatProviderModel(leaderProvider, leaderModelId);
+			const leaderModelDeprecated = leaderModelId ? isDeprecatedTeammateModelId(leaderModelId) : false;
+			const resolved = resolveTeammateModelSelection({
+				leaderProvider,
+				leaderModelId,
+			});
+			if (!resolved.ok) {
+				return compactResult(`Model policy resolution failed: ${resolved.error}`, {
+					action,
+					teamId,
+					error: resolved.error,
+					reason: resolved.reason,
+				});
+			}
+
+			const effectiveModel = formatProviderModel(resolved.value.provider, resolved.value.modelId);
+
+			return compactResult(
+				`Model policy: leader=${leaderModel ?? "(unknown)"}${leaderModelDeprecated ? " (deprecated)" : ""}, teammate default=${effectiveModel ?? "(inherit leader)"} (source=${describeModelSource(resolved.value.source)}). Override: '<provider>/<modelId>'.`,
+				{
+					action,
+					teamId,
+					deprecatedPolicy: {
+						family: "claude-sonnet-4",
+						allowedExceptions: ["claude-sonnet-4-5", "claude-sonnet-4.5"],
+					},
+					leader: {
+						provider: leaderProvider,
+						modelId: leaderModelId,
+						model: leaderModel,
+						deprecated: leaderModelDeprecated,
+					},
+					defaultSelection: {
+						source: resolved.value.source,
+						provider: resolved.value.provider,
+						modelId: resolved.value.modelId,
+						model: effectiveModel,
+						warnings: resolved.value.warnings,
+					},
+				},
+			);
+		}
+
+		if (action === "model_policy_check") {
+			const modelInput = params.model?.trim();
+			const resolved = resolveTeammateModelSelection({
+				modelOverride: modelInput,
+				leaderProvider: ctx.model?.provider,
+				leaderModelId: ctx.model?.id,
+			});
+
+			if (!resolved.ok) {
+				return compactResult(
+					`Model check rejected: ${modelInput ?? "(none)"} — ${resolved.error}`,
+					{
+						action,
+						teamId,
+						accepted: false,
+						input: modelInput,
+						error: resolved.error,
+						reason: resolved.reason,
+					},
+				);
+			}
+
+			const resolvedModel = formatProviderModel(resolved.value.provider, resolved.value.modelId);
+			const warnSuffix = resolved.value.warnings.length > 0 ? ` [${resolved.value.warnings.join("; ")}]` : "";
+			return compactResult(
+				`Model check accepted: ${modelInput ?? "(none)"} → ${resolvedModel ?? "(teammate default)"} (${describeModelSource(resolved.value.source)})${warnSuffix}`,
+				{
+					action,
+					teamId,
+					accepted: true,
+					input: modelInput,
+					source: resolved.value.source,
+					provider: resolved.value.provider,
+					modelId: resolved.value.modelId,
+					model: resolvedModel,
+					warnings: resolved.value.warnings,
+				},
+			);
+		}
+
+		if (action === "hooks_policy_get") {
+			const configuredFailureAction: TeamsHookFailureAction | undefined = cfg.hooks?.failureAction;
+			const configuredFollowupOwner: TeamsHookFollowupOwnerPolicy | undefined = cfg.hooks?.followupOwner;
+			const configuredMaxReopens = cfg.hooks?.maxReopensPerTask;
+
+			const effectiveFailureAction = getTeamsHookFailureAction(process.env, configuredFailureAction);
+			const effectiveFollowupOwner = getTeamsHookFollowupOwnerPolicy(process.env, configuredFollowupOwner);
+			const effectiveMaxReopens = getTeamsHookMaxReopensPerTask(process.env, configuredMaxReopens);
+
+			const overrides: string[] = [];
+			if (configuredFailureAction) overrides.push("failureAction");
+			if (configuredMaxReopens !== undefined) overrides.push("maxReopensPerTask");
+			if (configuredFollowupOwner) overrides.push("followupOwner");
+			const overrideSuffix = overrides.length > 0 ? ` (team overrides: ${overrides.join(", ")})` : " (all env defaults)";
+
+			return compactResult(
+				`Hooks: failureAction=${effectiveFailureAction}, maxReopens=${String(effectiveMaxReopens)}, followupOwner=${effectiveFollowupOwner}${overrideSuffix}`,
+				{
+					action,
+					teamId,
+					configured: {
+						failureAction: configuredFailureAction,
+						maxReopensPerTask: configuredMaxReopens,
+						followupOwner: configuredFollowupOwner,
+					},
+					effective: {
+						failureAction: effectiveFailureAction,
+						maxReopensPerTask: effectiveMaxReopens,
+						followupOwner: effectiveFollowupOwner,
+					},
+				},
+			);
+		}
+
+		if (action === "hooks_policy_set") {
+			const reset = params.hooksPolicyReset === true;
+			const nextFailureAction = params.hookFailureAction;
+			const nextMaxReopens = params.hookMaxReopensPerTask;
+			const nextFollowupOwner = params.hookFollowupOwner;
+			if (!reset && nextFailureAction === undefined && nextMaxReopens === undefined && nextFollowupOwner === undefined) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: "hooks_policy_set requires at least one policy field (or hooksPolicyReset=true)",
+						},
+					],
+					details: { action, reset },
+				};
+			}
+
+			const updatedCfg = await updateTeamHooksPolicy(teamDir, (current) => {
+				const next = reset ? {} : { ...current };
+				if (nextFailureAction !== undefined) next.failureAction = nextFailureAction;
+				if (nextMaxReopens !== undefined) next.maxReopensPerTask = nextMaxReopens;
+				if (nextFollowupOwner !== undefined) next.followupOwner = nextFollowupOwner;
+				if (
+					next.failureAction === undefined &&
+					next.maxReopensPerTask === undefined &&
+					next.followupOwner === undefined
+				) {
+					return undefined;
+				}
+				return next;
+			});
+			if (!updatedCfg) {
+				return {
+					content: [{ type: "text", text: "Failed to update hooks policy: team config missing" }],
+					details: { action, teamId },
+				};
+			}
+
+			await refreshUi();
+			const configuredFailureAction: TeamsHookFailureAction | undefined = updatedCfg.hooks?.failureAction;
+			const configuredFollowupOwner: TeamsHookFollowupOwnerPolicy | undefined = updatedCfg.hooks?.followupOwner;
+			const configuredMaxReopens = updatedCfg.hooks?.maxReopensPerTask;
+			const effectiveFailureAction = getTeamsHookFailureAction(process.env, configuredFailureAction);
+			const effectiveFollowupOwner = getTeamsHookFollowupOwnerPolicy(process.env, configuredFollowupOwner);
+			const effectiveMaxReopens = getTeamsHookMaxReopensPerTask(process.env, configuredMaxReopens);
+
+			return compactResult(
+				`Updated hooks: failureAction=${effectiveFailureAction}, maxReopens=${String(effectiveMaxReopens)}, followupOwner=${effectiveFollowupOwner}`,
+				{
+					action,
+					teamId,
+					reset,
+					configured: {
+						failureAction: configuredFailureAction,
+						maxReopensPerTask: configuredMaxReopens,
+						followupOwner: configuredFollowupOwner,
+					},
+					effective: {
+						failureAction: effectiveFailureAction,
+						maxReopensPerTask: effectiveMaxReopens,
+						followupOwner: effectiveFollowupOwner,
+					},
+				},
+			);
+		}
+
+		if (action !== "delegate") {
+			return {
+				content: [{ type: "text", text: `Unsupported action: ${String(action)}` }],
+				details: { action },
+			};
+		}
+
+		const inputTasks: TeamsToolDelegateTask[] = params.tasks ?? [];
+		if (inputTasks.length === 0) {
+			return {
+				content: [{ type: "text", text: "No tasks provided. Provide tasks: [{text, assignee?}, ...]" }],
+				details: { action },
+			};
+		}
+
+		const contextMode: ContextMode = params.contextMode === "branch" ? "branch" : "fresh";
+		const requestedWorkspaceMode: WorkspaceMode = params.workspaceMode === "worktree" ? "worktree" : "shared";
+		const modelOverride = params.model?.trim();
+		const spawnModel = modelOverride && modelOverride.length > 0 ? modelOverride : undefined;
+		const spawnThinking = params.thinking;
+
+		let teammateNames: string[] = [];
+		const explicit = params.teammates;
+		if (explicit && explicit.length) {
+			teammateNames = explicit.map((n) => sanitizeName(n)).filter((n) => n.length > 0);
+		}
+
+		if (teammateNames.length === 0 && teammates.size > 0) {
+			teammateNames = Array.from(teammates.keys());
+		}
+
+		if (teammateNames.length === 0) {
+			const maxTeammates = Math.max(1, Math.min(16, params.maxTeammates ?? 4));
+			const count = Math.min(maxTeammates, inputTasks.length);
+			const taken = new Set(teammates.keys());
+			const naming = getTeamsNamingRules(style);
+			teammateNames =
+				naming.autoNameStrategy.kind === "agent"
+					? pickAgentNames(count, taken)
+					: pickNamesFromPool({
+						pool: naming.autoNameStrategy.pool,
+						count,
+						taken,
+						fallbackBase: naming.autoNameStrategy.fallbackBase,
+					});
+		}
+
+		const spawned: string[] = [];
+		const warnings: string[] = [];
+
+		for (const name of teammateNames) {
+			if (signal?.aborted) break;
+			if (teammates.has(name)) continue;
+			const res = await spawnTeammate(ctx, {
+				name,
+				mode: contextMode,
+				workspaceMode: requestedWorkspaceMode,
+				model: spawnModel,
+				thinking: spawnThinking,
+			});
+			if (!res.ok) {
+				warnings.push(`Failed to spawn '${name}': ${res.error}`);
+				continue;
+			}
+			spawned.push(res.name);
+			warnings.push(...res.warnings);
+		}
+
+		const assignments: Array<{ taskId: string; assignee: string; subject: string }> = [];
+		let rr = 0;
+		for (const t of inputTasks) {
+			if (signal?.aborted) break;
+
+			const text = t.text.trim();
+			if (!text) {
+				warnings.push("Skipping empty task");
+				continue;
+			}
+
+			const explicitAssignee = t.assignee ? sanitizeName(t.assignee) : undefined;
+			const assignee = explicitAssignee ?? teammateNames[rr++ % teammateNames.length];
+			if (!assignee) {
+				warnings.push(`No assignee available for task: ${text.slice(0, 60)}`);
+				continue;
+			}
+
+			if (!teammates.has(assignee)) {
 				const res = await spawnTeammate(ctx, {
-					name,
+					name: assignee,
 					mode: contextMode,
 					workspaceMode: requestedWorkspaceMode,
 					model: spawnModel,
 					thinking: spawnThinking,
 				});
-				if (!res.ok) {
-					warnings.push(`Failed to spawn '${name}': ${res.error}`);
+				if (res.ok) {
+					spawned.push(res.name);
+					warnings.push(...res.warnings);
+				} else {
+					warnings.push(`Failed to spawn assignee '${assignee}': ${res.error}`);
 					continue;
 				}
-				spawned.push(res.name);
-				warnings.push(...res.warnings);
 			}
 
-			const assignments: Array<{ taskId: string; assignee: string; subject: string }> = [];
-			let rr = 0;
-			for (const t of inputTasks) {
-				if (signal?.aborted) break;
+			const description = text;
+			const firstLine = description.split("\n").at(0) ?? "";
+			const subject = firstLine.slice(0, 120);
+			const task = await createTask(teamDir, effectiveTlId, { subject, description, owner: assignee });
 
-				const text = t.text.trim();
-				if (!text) {
-					warnings.push("Skipping empty task");
-					continue;
-				}
-
-				const explicitAssignee = t.assignee ? sanitizeName(t.assignee) : undefined;
-				const assignee = explicitAssignee ?? teammateNames[rr++ % teammateNames.length];
-				if (!assignee) {
-					warnings.push(`No assignee available for task: ${text.slice(0, 60)}`);
-					continue;
-				}
-
-				if (!teammates.has(assignee)) {
-					const res = await spawnTeammate(ctx, {
-						name: assignee,
-						mode: contextMode,
-						workspaceMode: requestedWorkspaceMode,
-						model: spawnModel,
-						thinking: spawnThinking,
-					});
-					if (res.ok) {
-						spawned.push(res.name);
-						warnings.push(...res.warnings);
-					} else {
-						warnings.push(`Failed to spawn assignee '${assignee}': ${res.error}`);
-						continue;
-					}
-				}
-
-				const description = text;
-				const firstLine = description.split("\n").at(0) ?? "";
-				const subject = firstLine.slice(0, 120);
-				const task = await createTask(teamDir, effectiveTlId, { subject, description, owner: assignee });
-
-				await writeToMailbox(teamDir, effectiveTlId, assignee, {
-					from: cfg.leadName,
-					text: JSON.stringify(taskAssignmentPayload(task, cfg.leadName)),
-					timestamp: new Date().toISOString(),
-				});
-
-				assignments.push({ taskId: task.id, assignee, subject });
-			}
-
-			void refreshTasks().finally(renderWidget);
-
-			const lines: string[] = [];
-			lines.push(`Delegated ${assignments.length} task(s):`);
-			lines.push(...summarizeTaskAssignments(assignments, style));
-			if (spawned.length) lines.push(`Spawned: ${spawned.join(", ")}.`);
-			if (warnings.length) lines.push(`Warnings: ${warnings.join("; ")}`);
-
-			return compactResult(lines.join("\n"), {
-				action,
-				teamId,
-				taskListId: effectiveTlId,
-				contextMode,
-				workspaceMode: requestedWorkspaceMode,
-				model: spawnModel,
-				thinking: spawnThinking,
-				spawned,
-				assignments,
-				warnings,
+			await writeToMailbox(teamDir, effectiveTlId, assignee, {
+				from: cfg.leadName,
+				text: JSON.stringify(taskAssignmentPayload(task, cfg.leadName)),
+				timestamp: new Date().toISOString(),
 			});
-		},
-	});
+
+			assignments.push({ taskId: task.id, assignee, subject });
+		}
+
+		void refreshTasks().finally(renderWidget);
+
+		const lines: string[] = [];
+		lines.push(`Delegated ${assignments.length} task(s):`);
+		lines.push(...summarizeTaskAssignments(assignments, style));
+		if (spawned.length) lines.push(`Spawned: ${spawned.join(", ")}.`);
+		if (warnings.length) lines.push(`Warnings: ${warnings.join("; ")}`);
+
+		return compactResult(lines.join("\n"), {
+			action,
+			teamId,
+			taskListId: effectiveTlId,
+			contextMode,
+			workspaceMode: requestedWorkspaceMode,
+			model: spawnModel,
+			thinking: spawnThinking,
+			spawned,
+			assignments,
+			warnings,
+		});
+	}
 }

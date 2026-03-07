@@ -782,6 +782,7 @@ export function runLeader(pi: ExtensionAPI): void {
 		refreshTasks,
 		renderWidget,
 		pendingPlanApprovals,
+		getContextUsage: () => currentCtx?.getContextUsage(),
 	});
 
 	// Summarize-on-completion: replace stale teams tool results with a compact
