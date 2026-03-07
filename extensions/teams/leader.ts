@@ -32,6 +32,7 @@ import {
 import { handleTeamCommand } from "./leader-team-command.js";
 import { registerTeamsTool } from "./leader-teams-tool.js";
 import { buildTeamCompactionInstructions } from "./leader-compaction.js";
+import { buildTeamStateSnapshot, filterStaleTeamsResults } from "./leader-context-filter.js";
 import type { ContextMode, SpawnTeammateFn, SpawnTeammateResult, WorkspaceMode } from "./spawn-types.js";
 
 function getTeamsExtensionEntryPath(): string | null {
@@ -781,6 +782,27 @@ export function runLeader(pi: ExtensionAPI): void {
 		refreshTasks,
 		renderWidget,
 		pendingPlanApprovals,
+	});
+
+	// Summarize-on-completion: replace stale teams tool results with a compact
+	// state snapshot before each LLM call. This keeps the persisted session
+	// intact while dramatically reducing context tokens from past delegation
+	// cycles.
+	pi.on("context", (event, _ctx) => {
+		if (!currentTeamId) return;
+
+		const snapshot = buildTeamStateSnapshot(
+			tasks,
+			teammates,
+			teamConfig,
+			style,
+			pendingPlanApprovals,
+		);
+
+		const filtered = filterStaleTeamsResults(event.messages, snapshot);
+		if (filtered !== event.messages) {
+			return { messages: filtered };
+		}
 	});
 
 	const openWidget = async (ctx: ExtensionCommandContext) => {
