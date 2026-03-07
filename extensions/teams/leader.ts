@@ -31,6 +31,7 @@ import {
 } from "./hooks.js";
 import { handleTeamCommand } from "./leader-team-command.js";
 import { registerTeamsTool } from "./leader-teams-tool.js";
+import { buildTeamCompactionInstructions } from "./leader-compaction.js";
 import type { ContextMode, SpawnTeammateFn, SpawnTeammateResult, WorkspaceMode } from "./spawn-types.js";
 
 function getTeamsExtensionEntryPath(): string | null {
@@ -125,6 +126,7 @@ export function runLeader(pi: ExtensionAPI): void {
 	let inboxTimer: NodeJS.Timeout | null = null;
 	let refreshInFlight = false;
 	let inboxInFlight = false;
+	let compactionInFlight = false;
 	let isStopping = false;
 	let delegateMode = process.env.PI_TEAMS_DELEGATE_MODE === "1";
 	let style: TeamsStyle = getTeamsStyleFromEnv();
@@ -653,6 +655,23 @@ export function runLeader(pi: ExtensionAPI): void {
 				await heartbeatActiveAttachClaim(ctx);
 				await refreshTasks();
 				renderWidget();
+
+				// Check context usage and proactively trigger compaction at 70%
+				// to ensure team-aware custom instructions are used before pi's
+				// built-in compaction fires (typically ~85%).
+				const usage = ctx.getContextUsage();
+				if (usage?.percent !== null && usage?.percent !== undefined && usage.percent > 70 && !compactionInFlight) {
+					compactionInFlight = true;
+					ctx.compact({
+						customInstructions: buildTeamCompactionInstructions(tasks, teammates, teamConfig, style),
+						onComplete: () => {
+							compactionInFlight = false;
+						},
+						onError: () => {
+							compactionInFlight = false;
+						},
+					});
+				}
 			} finally {
 				refreshInFlight = false;
 			}
@@ -668,6 +687,12 @@ export function runLeader(pi: ExtensionAPI): void {
 				inboxInFlight = false;
 			}
 		}, 700);
+	});
+
+	pi.on("session_compact", (_event, _ctx) => {
+		if (currentCtx) {
+			currentCtx.ui.notify("Context compacted — team state preserved in summary", "info");
+		}
 	});
 
 	pi.on("session_switch", async (_event, ctx) => {
@@ -696,6 +721,7 @@ export function runLeader(pi: ExtensionAPI): void {
 		renderWidget();
 
 		// Restart background refresh/poll loops for the new session.
+		compactionInFlight = false;
 		refreshTimer = setInterval(async () => {
 			if (isStopping) return;
 			if (refreshInFlight) return;
@@ -704,6 +730,23 @@ export function runLeader(pi: ExtensionAPI): void {
 				await heartbeatActiveAttachClaim(ctx);
 				await refreshTasks();
 				renderWidget();
+
+				// Check context usage and proactively trigger compaction at 70%
+				// to ensure team-aware custom instructions are used before pi's
+				// built-in compaction fires (typically ~85%).
+				const usage = ctx.getContextUsage();
+				if (usage?.percent !== null && usage?.percent !== undefined && usage.percent > 70 && !compactionInFlight) {
+					compactionInFlight = true;
+					ctx.compact({
+						customInstructions: buildTeamCompactionInstructions(tasks, teammates, teamConfig, style),
+						onComplete: () => {
+							compactionInFlight = false;
+						},
+						onError: () => {
+							compactionInFlight = false;
+						},
+					});
+				}
 			} finally {
 				refreshInFlight = false;
 			}
