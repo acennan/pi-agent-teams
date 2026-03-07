@@ -1,130 +1,32 @@
-import { randomUUID } from "node:crypto";
-import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+/**
+ * Backward-compatibility shim for the legacy "teams" tool.
+ *
+ * New sessions should use the split tools: teams_delegate, teams_task,
+ * teams_message, teams_member, teams_policy. This shim exists so that
+ * resumed sessions with old "teams" tool calls in history can still
+ * function. It parses the old `action` field and routes to the
+ * appropriate handler.
+ *
+ * The schema is intentionally minimal (just `action` + catch-all fields)
+ * so it adds very few tokens to the LLM context.
+ */
+
 import { StringEnum } from "@mariozechner/pi-ai";
 import { Type, type Static } from "@sinclair/typebox";
-import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
-import { writeToMailbox } from "./mailbox.js";
-import { pickAgentNames, pickNamesFromPool, sanitizeName } from "./names.js";
-import { getTeamDir } from "./paths.js";
-import { TEAM_MAILBOX_NS, taskAssignmentPayload } from "./protocol.js";
-import { ensureTeamConfig, setMemberStatus, updateTeamHooksPolicy } from "./team-config.js";
-import { getTeamsNamingRules, getTeamsStyleFromEnv, type TeamsStyle, formatMemberDisplayName, getTeamsStrings } from "./teams-style.js";
-import {
-	formatProviderModel,
-	isDeprecatedTeammateModelId,
-	resolveTeammateModelSelection,
-	type TeammateModelSource,
-} from "./model-policy.js";
-import {
-	getTeamsHookFailureAction,
-	getTeamsHookFollowupOwnerPolicy,
-	getTeamsHookMaxReopensPerTask,
-	type TeamsHookFailureAction,
-	type TeamsHookFollowupOwnerPolicy,
-} from "./hooks.js";
-import {
-	addTaskDependency,
-	createTask,
-	getTask,
-	isTaskBlocked,
-	listTasks,
-	removeTaskDependency,
-	unassignTasksForAgent,
-	updateTask,
-} from "./task-store.js";
-import type { ContextUsage } from "@mariozechner/pi-coding-agent";
-import type { TeammateRpc } from "./teammate-rpc.js";
-import type { ContextMode, WorkspaceMode, SpawnTeammateFn } from "./spawn-types.js";
+import type { AgentToolResult } from "@mariozechner/pi-agent-core";
+import { type TeamToolOpts, appendContextWarning } from "./leader-tool-shared.js";
+import { executeDelegateAction } from "./leader-tool-delegate.js";
+import { executeTaskAction } from "./leader-tool-task.js";
+import { executeMessageAction } from "./leader-tool-message.js";
+import { executeMemberAction } from "./leader-tool-member.js";
+import { executePolicyAction } from "./leader-tool-policy.js";
 
-type TeamsToolDelegateTask = { text: string; assignee?: string };
+// ---------------------------------------------------------------------------
+// Legacy schema — kept minimal to reduce token overhead.
+// Only the `action` field and a generic catch-all for the rest.
+// ---------------------------------------------------------------------------
 
-/** Build a terse tool result — keeps content to a single text block for minimal context usage. */
-function compactResult(text: string, details: unknown): AgentToolResult<unknown> {
-	return {
-		content: [{ type: "text", text }],
-		details,
-	};
-}
-
-/** Threshold at which lists are summarized instead of fully enumerated. */
-const LIST_THRESHOLD = 4;
-
-/** Summarize a list of names: inline if ≤ threshold, otherwise show first 3 + "+N more". */
-function summarizeNameList(names: string[], style: TeamsStyle, noun: string): string {
-	if (names.length === 0) return `0 ${noun}(s)`;
-	if (names.length <= LIST_THRESHOLD) {
-		return `${names.length} ${noun}(s): ${names.map((n) => formatMemberDisplayName(style, n)).join(", ")}`;
-	}
-	const shown = names.slice(0, 3).map((n) => formatMemberDisplayName(style, n)).join(", ");
-	return `${names.length} ${noun}(s): ${shown}, +${names.length - 3} more`;
-}
-
-/** Summarize task assignments: full list if ≤ threshold, otherwise grouped by assignee. */
-function summarizeTaskAssignments(
-	assignments: Array<{ taskId: string; assignee: string; subject: string }>,
-	style: TeamsStyle,
-): string[] {
-	const lines: string[] = [];
-	if (assignments.length <= LIST_THRESHOLD) {
-		for (const a of assignments) {
-			lines.push(`#${a.taskId} → ${formatMemberDisplayName(style, a.assignee)}: ${a.subject}`);
-		}
-	} else {
-		// Group by assignee for compact output
-		const byAssignee = new Map<string, string[]>();
-		for (const a of assignments) {
-			const ids = byAssignee.get(a.assignee) ?? [];
-			ids.push(`#${a.taskId}`);
-			byAssignee.set(a.assignee, ids);
-		}
-		for (const [assignee, ids] of byAssignee) {
-			lines.push(`${formatMemberDisplayName(style, assignee)}: ${ids.join(", ")}`);
-		}
-	}
-	return lines;
-}
-
-function describeModelSource(source: TeammateModelSource): string {
-	if (source === "override") return "override";
-	if (source === "inherit_leader") return "leader";
-	return "teammate-default";
-}
-
-/**
- * Append a context-usage warning to a tool result when context pressure is
- * high. The warning is placed in a second `content` block so the LLM sees
- * it alongside the result and can self-regulate (e.g., defer new delegations,
- * skip policy queries).
- */
-function appendContextWarning(
-	result: AgentToolResult<unknown>,
-	usage: ContextUsage | undefined,
-	triggerCompaction?: () => void,
-): AgentToolResult<unknown> {
-	const percent = usage?.percent;
-	if (percent === null || percent === undefined || percent < 65) return result;
-
-	let warning: string;
-	if (percent > 80) {
-		warning = `⚠️ Context ${percent.toFixed(0)}% full. Finish active tasks before delegating more. Avoid policy queries.`;
-	} else {
-		warning = `Context at ${percent.toFixed(0)}%. Consider wrapping up current delegation cycle.`;
-	}
-
-	// Escalation: trigger proactive compaction at >85% as a secondary safety
-	// net. The primary trigger is the 1-second refresh loop at 70% (Strategy B),
-	// but a large tool result can spike context usage between refresh ticks.
-	if (percent > 85 && triggerCompaction) {
-		triggerCompaction();
-	}
-
-	return {
-		...result,
-		content: [...result.content, { type: "text" as const, text: warning }],
-	};
-}
-
-const TeamsActionSchema = StringEnum(
+const LegacyActionSchema = StringEnum(
 	[
 		"delegate",
 		"task_assign",
@@ -147,985 +49,96 @@ const TeamsActionSchema = StringEnum(
 		"model_policy_get",
 		"model_policy_check",
 	] as const,
-	{
-		description: "Teams tool action.",
-		default: "delegate",
-	},
+	{ description: "Legacy action. Prefer the split tools: teams_delegate, teams_task, teams_message, teams_member, teams_policy." },
 );
 
-const TeamsTaskStatusSchema = StringEnum(["pending", "in_progress", "completed"] as const, {
-	description: "Task status for action=task_set_status.",
+const LegacyParamsSchema = Type.Object({
+	action: Type.Optional(LegacyActionSchema),
+	// Catch-all fields so old tool calls still parse. Using Type.Unknown
+	// allows any value without inflating the schema with per-field descriptions.
+	tasks: Type.Optional(Type.Unknown()),
+	taskId: Type.Optional(Type.String()),
+	depId: Type.Optional(Type.String()),
+	assignee: Type.Optional(Type.String()),
+	status: Type.Optional(Type.String()),
+	name: Type.Optional(Type.String()),
+	message: Type.Optional(Type.String()),
+	reason: Type.Optional(Type.String()),
+	feedback: Type.Optional(Type.String()),
+	all: Type.Optional(Type.Boolean()),
+	planRequired: Type.Optional(Type.Boolean()),
+	teammates: Type.Optional(Type.Unknown()),
+	maxTeammates: Type.Optional(Type.Integer()),
+	contextMode: Type.Optional(Type.String()),
+	workspaceMode: Type.Optional(Type.String()),
+	model: Type.Optional(Type.String()),
+	thinking: Type.Optional(Type.String()),
+	hookFailureAction: Type.Optional(Type.String()),
+	hookMaxReopensPerTask: Type.Optional(Type.Integer()),
+	hookFollowupOwner: Type.Optional(Type.String()),
+	hooksPolicyReset: Type.Optional(Type.Boolean()),
 });
 
-const TeamsContextModeSchema = StringEnum(["fresh", "branch"] as const, {
-	description: "How to initialize comrade session context. 'branch' clones the leader session branch.",
-	default: "fresh",
-});
+type LegacyParams = Static<typeof LegacyParamsSchema>;
 
-const TeamsWorkspaceModeSchema = StringEnum(["shared", "worktree"] as const, {
-	description: "Workspace isolation mode. 'shared' matches Claude Teams; 'worktree' creates a git worktree per comrade.",
-	default: "shared",
-});
+// ---------------------------------------------------------------------------
+// Action routing map: old action → { strip prefix, target handler }
+// ---------------------------------------------------------------------------
 
-const TeamsThinkingLevelSchema = StringEnum(["off", "minimal", "low", "medium", "high", "xhigh"] as const, {
-	description:
-		"Thinking level to use for spawned comrades (defaults to the leader's current thinking level when omitted).",
-});
+const TASK_PREFIX = "task_";
+const MESSAGE_PREFIX = "message_";
+const MEMBER_PREFIX = "member_";
+const POLICY_REMAP: Record<string, string> = {
+	hooks_policy_get: "hooks_get",
+	hooks_policy_set: "hooks_set",
+	model_policy_get: "model_get",
+	model_policy_check: "model_check",
+	plan_approve: "plan_approve",
+	plan_reject: "plan_reject",
+};
 
-const TeamsHookFailureActionSchema = StringEnum(["warn", "followup", "reopen", "reopen_followup"] as const, {
-	description: "Hook failure policy for hooks_policy_set.",
-});
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
 
-const TeamsHookFollowupOwnerSchema = StringEnum(["member", "lead", "none"] as const, {
-	description: "Follow-up owner policy for hooks_policy_set.",
-});
-
-const TeamsDelegateTaskSchema = Type.Object({
-	text: Type.String({ description: "Task / TODO text." }),
-	assignee: Type.Optional(Type.String({ description: "Optional comrade name. If omitted, assigned round-robin." })),
-});
-
-const TeamsToolParamsSchema = Type.Object({
-	action: Type.Optional(TeamsActionSchema),
-	tasks: Type.Optional(Type.Array(TeamsDelegateTaskSchema, { description: "Tasks to delegate (action=delegate)." })),
-	taskId: Type.Optional(Type.String({ description: "Task id for task mutation actions." })),
-	depId: Type.Optional(Type.String({ description: "Dependency task id for task_dep_add/task_dep_rm." })),
-	assignee: Type.Optional(Type.String({ description: "Assignee name for action=task_assign." })),
-	status: Type.Optional(TeamsTaskStatusSchema),
-	name: Type.Optional(Type.String({ description: "Teammate name for member/message actions." })),
-	message: Type.Optional(Type.String({ description: "Message body for messaging actions." })),
-	reason: Type.Optional(Type.String({ description: "Optional reason for lifecycle actions." })),
-	feedback: Type.Optional(Type.String({ description: "Feedback for action=plan_reject." })),
-	all: Type.Optional(Type.Boolean({ description: "For member_shutdown/member_prune, apply to all workers." })),
-	planRequired: Type.Optional(Type.Boolean({ description: "For member_spawn, start worker in plan-required mode." })),
-	teammates: Type.Optional(
-		Type.Array(Type.String(), {
-			description: "Explicit comrade names to use/spawn. If omitted, uses existing or auto-generates.",
-		}),
-	),
-	maxTeammates: Type.Optional(
-		Type.Integer({
-			description: "If comrades list is omitted and none exist, spawn up to this many.",
-			default: 4,
-			minimum: 1,
-			maximum: 16,
-		}),
-	),
-	contextMode: Type.Optional(TeamsContextModeSchema),
-	workspaceMode: Type.Optional(TeamsWorkspaceModeSchema),
-	model: Type.Optional(
-		Type.String({
-			description:
-				"Optional model override for spawned comrades. Use '<provider>/<modelId>'. If you pass only '<modelId>', the provider is inherited from the leader when available.",
-		}),
-	),
-	thinking: Type.Optional(TeamsThinkingLevelSchema),
-	hookFailureAction: Type.Optional(TeamsHookFailureActionSchema),
-	hookMaxReopensPerTask: Type.Optional(
-		Type.Integer({ minimum: 0, description: "Per-task auto-reopen cap for hooks_policy_set (0 disables auto-reopen)." }),
-	),
-	hookFollowupOwner: Type.Optional(TeamsHookFollowupOwnerSchema),
-	hooksPolicyReset: Type.Optional(Type.Boolean({ description: "For hooks_policy_set, clear team-level overrides before applying fields." })),
-});
-
-type TeamsToolParamsType = Static<typeof TeamsToolParamsSchema>;
-
-export function registerTeamsTool(opts: {
-	pi: ExtensionAPI;
-	teammates: Map<string, TeammateRpc>;
-	spawnTeammate: SpawnTeammateFn;
-	getTeamId: (ctx: Parameters<SpawnTeammateFn>[0]) => string;
-	getTaskListId: () => string | null;
-	refreshTasks: () => Promise<void>;
-	renderWidget: () => void;
-	pendingPlanApprovals: Map<string, { requestId: string; name: string; taskId?: string }>;
-	getContextUsage: () => ContextUsage | undefined;
-	triggerCompaction?: () => void;
-}): void {
-	const { pi, teammates, spawnTeammate, getTeamId, getTaskListId, refreshTasks, renderWidget, pendingPlanApprovals, getContextUsage, triggerCompaction } = opts;
+export function registerTeamsTool(opts: TeamToolOpts): void {
+	const { pi, getContextUsage, triggerCompaction } = opts;
 
 	pi.registerTool({
 		name: "teams",
-		label: "Teams",
-		description: [
-			"Spawn comrade agents and delegate tasks. Each comrade is a child Pi process that executes work autonomously and reports back.",
-			"You can also mutate existing tasks (assign, unassign, set status, dependencies), send team messages, run teammate lifecycle actions, and manage hooks/model policy without user slash commands.",
-			"Provide a list of tasks with optional assignees; comrades are spawned automatically and assigned round-robin if unspecified.",
-			"Options: contextMode=branch (clone session context), workspaceMode=worktree (git worktree isolation).",
-			"Optional overrides: model='<provider>/<modelId>' and thinking (off|minimal|low|medium|high|xhigh).",
-			"For governance, the user can run /team delegate on (leader restricted to coordination) or /team spawn <name> plan (worker needs plan approval).",
-		].join(" "),
-		parameters: TeamsToolParamsSchema,
+		label: "Teams (legacy)",
+		description:
+			"Deprecated — prefer teams_delegate, teams_task, teams_message, teams_member, teams_policy. " +
+			"This shim routes old action names to the new tools.",
+		parameters: LegacyParamsSchema,
 
-		async execute(_toolCallId, params: TeamsToolParamsType, signal, _onUpdate, ctx): Promise<AgentToolResult<unknown>> {
-			const result = await executeTeamsAction(params, signal, ctx);
+		async execute(_toolCallId, params: LegacyParams, signal, _onUpdate, ctx) {
+			const action = (params.action ?? "delegate") as string;
+			let result: AgentToolResult<unknown>;
+
+			if (action === "delegate") {
+				// biome-ignore lint: legacy shim intentionally passes untyped params
+				result = await executeDelegateAction(opts, params as any, signal, ctx);
+			} else if (action.startsWith(TASK_PREFIX)) {
+				const taskAction = action.slice(TASK_PREFIX.length);
+				result = await executeTaskAction(opts, { ...params, action: taskAction } as any, ctx);
+			} else if (action.startsWith(MESSAGE_PREFIX)) {
+				const msgAction = action.slice(MESSAGE_PREFIX.length);
+				result = await executeMessageAction(opts, { ...params, action: msgAction } as any, ctx);
+			} else if (action.startsWith(MEMBER_PREFIX)) {
+				const memberAction = action.slice(MEMBER_PREFIX.length);
+				result = await executeMemberAction(opts, { ...params, action: memberAction } as any, signal, ctx);
+			} else if (action in POLICY_REMAP) {
+				const policyAction = POLICY_REMAP[action]!;
+				result = await executePolicyAction(opts, { ...params, action: policyAction } as any, ctx);
+			} else {
+				result = {
+					content: [{ type: "text", text: `Unknown legacy action: ${action}. Use the split tools instead.` }],
+					details: { action },
+				};
+			}
+
 			return appendContextWarning(result, getContextUsage(), triggerCompaction);
 		},
 	});
-
-	async function executeTeamsAction(
-		params: TeamsToolParamsType,
-		signal: AbortSignal | undefined,
-		ctx: Parameters<SpawnTeammateFn>[0],
-	): Promise<AgentToolResult<unknown>> {
-		const action = params.action ?? "delegate";
-		const teamId = getTeamId(ctx);
-		const teamDir = getTeamDir(teamId);
-		const taskListId = getTaskListId();
-		const effectiveTlId = taskListId ?? teamId;
-		const cfg = await ensureTeamConfig(teamDir, {
-			teamId,
-			taskListId: effectiveTlId,
-			leadName: "team-lead",
-			style: getTeamsStyleFromEnv(),
-		});
-		const style: TeamsStyle = cfg.style ?? getTeamsStyleFromEnv();
-		const strings = getTeamsStrings(style);
-
-		const refreshUi = async (): Promise<void> => {
-			await refreshTasks();
-			renderWidget();
-		};
-
-		if (action === "task_set_status") {
-			const taskId = params.taskId?.trim();
-			const status = params.status;
-			if (!taskId || !status) {
-				return {
-					content: [{ type: "text", text: "task_set_status requires taskId and status" }],
-					details: { action, taskId, status },
-				};
-			}
-
-			const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-				if (cur.status === status) return cur;
-				const metadata = { ...(cur.metadata ?? {}) };
-				if (status === "completed") metadata.completedAt = new Date().toISOString();
-				if (status !== "completed" && cur.status === "completed") metadata.reopenedAt = new Date().toISOString();
-				return { ...cur, status, metadata };
-			});
-			if (!updated) {
-				return {
-					content: [{ type: "text", text: `Task not found: ${taskId}` }],
-					details: { action, taskId, status },
-				};
-			}
-
-			await refreshUi();
-			return {
-				content: [{ type: "text", text: `Updated task #${updated.id}: status=${updated.status}` }],
-				details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id, status: updated.status },
-			};
-		}
-
-		if (action === "task_unassign") {
-			const taskId = params.taskId?.trim();
-			if (!taskId) {
-				return {
-					content: [{ type: "text", text: "task_unassign requires taskId" }],
-					details: { action },
-				};
-			}
-
-			const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-				if (!cur.owner) return cur;
-				if (cur.status === "completed") return { ...cur, owner: undefined };
-				const metadata = { ...(cur.metadata ?? {}) };
-				metadata.unassignedAt = new Date().toISOString();
-				metadata.unassignedBy = cfg.leadName;
-				metadata.unassignedReason = "teams-tool";
-				return { ...cur, owner: undefined, status: "pending", metadata };
-			});
-			if (!updated) {
-				return {
-					content: [{ type: "text", text: `Task not found: ${taskId}` }],
-					details: { action, taskId },
-				};
-			}
-
-			await refreshUi();
-			return {
-				content: [{ type: "text", text: `Unassigned task #${updated.id}` }],
-				details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id },
-			};
-		}
-
-		if (action === "task_assign") {
-			const taskId = params.taskId?.trim();
-			const assignee = sanitizeName(params.assignee ?? "");
-			if (!taskId || !assignee) {
-				return {
-					content: [{ type: "text", text: "task_assign requires taskId and assignee" }],
-					details: { action, taskId, assignee: params.assignee },
-				};
-			}
-
-			const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-				const metadata = { ...(cur.metadata ?? {}) };
-				metadata.reassignedAt = new Date().toISOString();
-				metadata.reassignedBy = cfg.leadName;
-				metadata.reassignedTo = assignee;
-				if (cur.status === "completed") return { ...cur, owner: assignee, metadata };
-				return { ...cur, owner: assignee, status: "pending", metadata };
-			});
-			if (!updated) {
-				return {
-					content: [{ type: "text", text: `Task not found: ${taskId}` }],
-					details: { action, taskId, assignee },
-				};
-			}
-
-			await writeToMailbox(teamDir, effectiveTlId, assignee, {
-				from: cfg.leadName,
-				text: JSON.stringify(taskAssignmentPayload(updated, cfg.leadName)),
-				timestamp: new Date().toISOString(),
-			});
-
-			await refreshUi();
-			return {
-				content: [{ type: "text", text: `Assigned task #${updated.id} to ${formatMemberDisplayName(style, assignee)}` }],
-				details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id, assignee },
-			};
-		}
-
-		if (action === "task_dep_add" || action === "task_dep_rm") {
-			const taskId = params.taskId?.trim();
-			const depId = params.depId?.trim();
-			if (!taskId || !depId) {
-				return {
-					content: [{ type: "text", text: `${action} requires taskId and depId` }],
-					details: { action, taskId, depId },
-				};
-			}
-
-			const res = action === "task_dep_add"
-				? await addTaskDependency(teamDir, effectiveTlId, taskId, depId)
-				: await removeTaskDependency(teamDir, effectiveTlId, taskId, depId);
-			if (!res.ok) {
-				return {
-					content: [{ type: "text", text: res.error }],
-					details: { action, taskId, depId, error: res.error },
-				};
-			}
-
-			await refreshUi();
-			return {
-				content: [{ type: "text", text: action === "task_dep_add" ? `Added dependency: #${taskId} depends on #${depId}` : `Removed dependency: #${taskId} no longer depends on #${depId}` }],
-				details: { action, teamId, taskListId: effectiveTlId, taskId, depId },
-			};
-		}
-
-		if (action === "task_dep_ls") {
-			const taskId = params.taskId?.trim();
-			if (!taskId) {
-				return {
-					content: [{ type: "text", text: "task_dep_ls requires taskId" }],
-					details: { action },
-				};
-			}
-
-			const task = await getTask(teamDir, effectiveTlId, taskId);
-			if (!task) {
-				return {
-					content: [{ type: "text", text: `Task not found: ${taskId}` }],
-					details: { action, taskId },
-				};
-			}
-			const blocked = task.status !== "completed" && (await isTaskBlocked(teamDir, effectiveTlId, task));
-			const all = await listTasks(teamDir, effectiveTlId);
-			const byId = new Map<string, (typeof all)[number]>();
-			for (const t of all) byId.set(t.id, t);
-
-			const lines: string[] = [];
-			lines.push(`#${task.id} ${task.subject}`);
-			lines.push(`${blocked ? "blocked" : "unblocked"} • deps:${task.blockedBy.length} • blocks:${task.blocks.length}`);
-			lines.push("");
-			const MAX_DEPS = 6;
-
-			lines.push("blockedBy:");
-			if (task.blockedBy.length === 0) {
-				lines.push("  (none)");
-			} else {
-				const depsToShow = task.blockedBy.slice(0, MAX_DEPS);
-				for (const id of depsToShow) {
-					const dep = byId.get(id) ?? (await getTask(teamDir, effectiveTlId, id));
-					lines.push(dep ? `  - #${id} ${dep.status} ${dep.subject}` : `  - #${id} (missing)`);
-				}
-				if (task.blockedBy.length > MAX_DEPS) {
-					lines.push(`  ... +${task.blockedBy.length - MAX_DEPS} more`);
-				}
-			}
-			lines.push("");
-			lines.push("blocks:");
-			if (task.blocks.length === 0) {
-				lines.push("  (none)");
-			} else {
-				const blocksToShow = task.blocks.slice(0, MAX_DEPS);
-				for (const id of blocksToShow) {
-					const child = byId.get(id) ?? (await getTask(teamDir, effectiveTlId, id));
-					lines.push(child ? `  - #${id} ${child.status} ${child.subject}` : `  - #${id} (missing)`);
-				}
-				if (task.blocks.length > MAX_DEPS) {
-					lines.push(`  ... +${task.blocks.length - MAX_DEPS} more`);
-				}
-			}
-
-			return {
-				content: [{ type: "text", text: lines.join("\n") }],
-				details: { action, teamId, taskListId: effectiveTlId, taskId, blocked },
-			};
-		}
-
-		if (action === "message_dm") {
-			const nameRaw = params.name?.trim();
-			const message = params.message?.trim();
-			if (!nameRaw || !message) {
-				return {
-					content: [{ type: "text", text: "message_dm requires name and message" }],
-					details: { action, name: nameRaw },
-				};
-			}
-			const name = sanitizeName(nameRaw);
-			await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-				from: cfg.leadName,
-				text: message,
-				timestamp: new Date().toISOString(),
-			});
-			return {
-				content: [{ type: "text", text: `DM queued for ${formatMemberDisplayName(style, name)}` }],
-				details: { action, teamId, name, mailboxNamespace: TEAM_MAILBOX_NS },
-			};
-		}
-
-		if (action === "message_broadcast") {
-			const message = params.message?.trim();
-			if (!message) {
-				return {
-					content: [{ type: "text", text: "message_broadcast requires message" }],
-					details: { action },
-				};
-			}
-			const recipients = new Set<string>();
-			for (const m of cfg.members) {
-				if (m.role === "worker") recipients.add(m.name);
-			}
-			for (const name of teammates.keys()) recipients.add(name);
-			const allTasks = await listTasks(teamDir, effectiveTlId);
-			for (const t of allTasks) {
-				if (t.owner && t.owner !== cfg.leadName) recipients.add(t.owner);
-			}
-			const names = Array.from(recipients).sort();
-			if (names.length === 0) {
-				return compactResult(`No ${strings.memberTitle.toLowerCase()}s to broadcast to`, { action, recipients: [] });
-			}
-			const ts = new Date().toISOString();
-			await Promise.all(
-				names.map((name) =>
-					writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-						from: cfg.leadName,
-						text: message,
-						timestamp: ts,
-					}),
-				),
-			);
-			return compactResult(
-				`Broadcast queued for ${summarizeNameList(names, style, strings.memberTitle.toLowerCase())}`,
-				{ action, teamId, recipients: names, mailboxNamespace: TEAM_MAILBOX_NS },
-			);
-		}
-
-		if (action === "message_steer") {
-			const nameRaw = params.name?.trim();
-			const message = params.message?.trim();
-			if (!nameRaw || !message) {
-				return {
-					content: [{ type: "text", text: "message_steer requires name and message" }],
-					details: { action, name: nameRaw },
-				};
-			}
-			const name = sanitizeName(nameRaw);
-			const rpc = teammates.get(name);
-			if (!rpc) {
-				return {
-					content: [{ type: "text", text: `Unknown ${strings.memberTitle.toLowerCase()}: ${name}` }],
-					details: { action, name },
-				};
-			}
-			await rpc.steer(message);
-			renderWidget();
-			return {
-				content: [{ type: "text", text: `Steering sent to ${formatMemberDisplayName(style, name)}` }],
-				details: { action, teamId, name },
-			};
-		}
-
-		if (action === "member_spawn") {
-			const nameRaw = params.name?.trim();
-			const name = sanitizeName(nameRaw ?? "");
-			if (!name) {
-				return {
-					content: [{ type: "text", text: "member_spawn requires name" }],
-					details: { action, name: nameRaw },
-				};
-			}
-			if (teammates.has(name)) {
-				return {
-					content: [{ type: "text", text: `${formatMemberDisplayName(style, name)} is already running` }],
-					details: { action, teamId, name, alreadyRunning: true },
-				};
-			}
-
-			const contextMode: ContextMode = params.contextMode === "branch" ? "branch" : "fresh";
-			const workspaceMode: WorkspaceMode = params.workspaceMode === "worktree" ? "worktree" : "shared";
-			const modelOverride = params.model?.trim();
-			const spawnModel = modelOverride && modelOverride.length > 0 ? modelOverride : undefined;
-			const res = await spawnTeammate(ctx, {
-				name,
-				mode: contextMode,
-				workspaceMode,
-				model: spawnModel,
-				thinking: params.thinking,
-				planRequired: params.planRequired === true,
-			});
-
-			if (!res.ok) {
-				return {
-					content: [{ type: "text", text: `Failed to spawn ${formatMemberDisplayName(style, name)}: ${res.error}` }],
-					details: { action, teamId, name, error: res.error },
-				};
-			}
-
-			await refreshUi();
-			const lines: string[] = [
-				`Spawned ${formatMemberDisplayName(style, res.name)} (${res.mode}/${res.workspaceMode})`,
-			];
-			if (res.note) lines.push(`note: ${res.note}`);
-			for (const w of res.warnings) lines.push(`warning: ${w}`);
-			return {
-				content: [{ type: "text", text: lines.join("\n") }],
-				details: { action, teamId, name: res.name, mode: res.mode, workspaceMode: res.workspaceMode, warnings: res.warnings },
-			};
-		}
-
-		if (action === "member_kill") {
-			const nameRaw = params.name?.trim();
-			const name = sanitizeName(nameRaw ?? "");
-			if (!name) {
-				return {
-					content: [{ type: "text", text: "member_kill requires name" }],
-					details: { action, name: nameRaw },
-				};
-			}
-			const rpc = teammates.get(name);
-			if (!rpc) {
-				return {
-					content: [{ type: "text", text: `Unknown ${strings.memberTitle.toLowerCase()}: ${name}` }],
-					details: { action, name },
-				};
-			}
-
-			await rpc.stop();
-			teammates.delete(name);
-			await unassignTasksForAgent(teamDir, effectiveTlId, name, `${formatMemberDisplayName(style, name)} ${strings.killedVerb}`);
-			await setMemberStatus(teamDir, name, "offline", { meta: { killedAt: new Date().toISOString() } });
-			await refreshUi();
-			return {
-				content: [{ type: "text", text: `${formatMemberDisplayName(style, name)} ${strings.killedVerb} (SIGTERM)` }],
-				details: { action, teamId, name },
-			};
-		}
-
-		if (action === "member_shutdown") {
-			const reason = params.reason?.trim();
-			const all = params.all === true;
-			const explicitName = sanitizeName(params.name?.trim() ?? "");
-			if (!all && !explicitName) {
-				return {
-					content: [{ type: "text", text: "member_shutdown requires name (or all=true)" }],
-					details: { action },
-				};
-			}
-
-			const recipients = new Set<string>();
-			if (all) {
-				for (const m of cfg.members) {
-					if (m.role === "worker" && m.status === "online") recipients.add(m.name);
-				}
-				for (const name of teammates.keys()) recipients.add(name);
-			} else if (explicitName) {
-				recipients.add(explicitName);
-			}
-
-			const names = Array.from(recipients).sort();
-			if (names.length === 0) {
-				return compactResult(`No ${strings.memberTitle.toLowerCase()}s to shut down`, { action, all, recipients: [] });
-			}
-
-			const ts = new Date().toISOString();
-			for (const name of names) {
-				const requestId = randomUUID();
-				await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-					from: cfg.leadName,
-					text: JSON.stringify({
-						type: "shutdown_request",
-						requestId,
-						from: cfg.leadName,
-						timestamp: ts,
-						...(reason ? { reason } : {}),
-					}),
-					timestamp: ts,
-				});
-				await setMemberStatus(teamDir, name, "online", {
-					meta: {
-						shutdownRequestedAt: ts,
-						shutdownRequestId: requestId,
-						...(reason ? { shutdownReason: reason } : {}),
-					},
-				});
-			}
-
-			await refreshUi();
-			return compactResult(
-				`Shutdown requested for ${summarizeNameList(names, style, strings.memberTitle.toLowerCase())}`,
-				{ action, teamId, names, all, reason },
-			);
-		}
-
-		if (action === "member_prune") {
-			const all = params.all === true;
-			const workers = cfg.members.filter((m) => m.role === "worker");
-			if (workers.length === 0) {
-				return compactResult(`No ${strings.memberTitle.toLowerCase()}s to prune`, { action, teamId, pruned: [] });
-			}
-
-			const tasks = await listTasks(teamDir, effectiveTlId);
-			const inProgressOwners = new Set<string>();
-			for (const t of tasks) {
-				if (t.owner && t.status === "in_progress") inProgressOwners.add(t.owner);
-			}
-
-			const cutoffMs = 60 * 60 * 1000;
-			const now = Date.now();
-			const pruned: string[] = [];
-			for (const m of workers) {
-				if (teammates.has(m.name)) continue;
-				if (inProgressOwners.has(m.name)) continue;
-				if (!all) {
-					const lastSeen = m.lastSeenAt ? Date.parse(m.lastSeenAt) : Number.NaN;
-					if (!Number.isFinite(lastSeen)) continue;
-					if (now - lastSeen < cutoffMs) continue;
-				}
-				await setMemberStatus(teamDir, m.name, "offline", {
-					meta: { prunedAt: new Date().toISOString(), prunedBy: "teams-tool" },
-				});
-				pruned.push(m.name);
-			}
-
-			await refreshUi();
-			if (pruned.length === 0) {
-				return compactResult(
-					`No stale ${strings.memberTitle.toLowerCase()}s to prune${all ? "" : " (use all=true to force)"}`,
-					{ action, teamId, pruned },
-				);
-			}
-			return compactResult(
-				`Pruned ${summarizeNameList(pruned, style, `stale ${strings.memberTitle.toLowerCase()}`)}`,
-				{ action, teamId, pruned },
-			);
-		}
-
-		if (action === "plan_approve") {
-			const nameRaw = params.name?.trim();
-			const name = sanitizeName(nameRaw ?? "");
-			if (!name) {
-				return {
-					content: [{ type: "text", text: "plan_approve requires name" }],
-					details: { action, name: nameRaw },
-				};
-			}
-			const pending = pendingPlanApprovals.get(name);
-			if (!pending) {
-				return {
-					content: [{ type: "text", text: `No pending plan approval for ${name}` }],
-					details: { action, name },
-				};
-			}
-			const ts = new Date().toISOString();
-			await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-				from: cfg.leadName,
-				text: JSON.stringify({
-					type: "plan_approved",
-					requestId: pending.requestId,
-					from: cfg.leadName,
-					timestamp: ts,
-				}),
-				timestamp: ts,
-			});
-			pendingPlanApprovals.delete(name);
-			return {
-				content: [{ type: "text", text: `Approved plan for ${formatMemberDisplayName(style, name)}` }],
-				details: { action, teamId, name, requestId: pending.requestId, taskId: pending.taskId },
-			};
-		}
-
-		if (action === "plan_reject") {
-			const nameRaw = params.name?.trim();
-			const name = sanitizeName(nameRaw ?? "");
-			if (!name) {
-				return {
-					content: [{ type: "text", text: "plan_reject requires name" }],
-					details: { action, name: nameRaw },
-				};
-			}
-			const pending = pendingPlanApprovals.get(name);
-			if (!pending) {
-				return {
-					content: [{ type: "text", text: `No pending plan approval for ${name}` }],
-					details: { action, name },
-				};
-			}
-			const feedback = params.feedback?.trim() || params.reason?.trim() || "Plan rejected";
-			const ts = new Date().toISOString();
-			await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-				from: cfg.leadName,
-				text: JSON.stringify({
-					type: "plan_rejected",
-					requestId: pending.requestId,
-					from: cfg.leadName,
-					feedback,
-					timestamp: ts,
-				}),
-				timestamp: ts,
-			});
-			pendingPlanApprovals.delete(name);
-			return {
-				content: [{ type: "text", text: `Rejected plan for ${formatMemberDisplayName(style, name)}: ${feedback}` }],
-				details: { action, teamId, name, requestId: pending.requestId, taskId: pending.taskId, feedback },
-			};
-		}
-
-		if (action === "model_policy_get") {
-			const leaderProvider = ctx.model?.provider;
-			const leaderModelId = ctx.model?.id;
-			const leaderModel = formatProviderModel(leaderProvider, leaderModelId);
-			const leaderModelDeprecated = leaderModelId ? isDeprecatedTeammateModelId(leaderModelId) : false;
-			const resolved = resolveTeammateModelSelection({
-				leaderProvider,
-				leaderModelId,
-			});
-			if (!resolved.ok) {
-				return compactResult(`Model policy resolution failed: ${resolved.error}`, {
-					action,
-					teamId,
-					error: resolved.error,
-					reason: resolved.reason,
-				});
-			}
-
-			const effectiveModel = formatProviderModel(resolved.value.provider, resolved.value.modelId);
-
-			return compactResult(
-				`Model policy: leader=${leaderModel ?? "(unknown)"}${leaderModelDeprecated ? " (deprecated)" : ""}, teammate default=${effectiveModel ?? "(inherit leader)"} (source=${describeModelSource(resolved.value.source)}). Override: '<provider>/<modelId>'.`,
-				{
-					action,
-					teamId,
-					deprecatedPolicy: {
-						family: "claude-sonnet-4",
-						allowedExceptions: ["claude-sonnet-4-5", "claude-sonnet-4.5"],
-					},
-					leader: {
-						provider: leaderProvider,
-						modelId: leaderModelId,
-						model: leaderModel,
-						deprecated: leaderModelDeprecated,
-					},
-					defaultSelection: {
-						source: resolved.value.source,
-						provider: resolved.value.provider,
-						modelId: resolved.value.modelId,
-						model: effectiveModel,
-						warnings: resolved.value.warnings,
-					},
-				},
-			);
-		}
-
-		if (action === "model_policy_check") {
-			const modelInput = params.model?.trim();
-			const resolved = resolveTeammateModelSelection({
-				modelOverride: modelInput,
-				leaderProvider: ctx.model?.provider,
-				leaderModelId: ctx.model?.id,
-			});
-
-			if (!resolved.ok) {
-				return compactResult(
-					`Model check rejected: ${modelInput ?? "(none)"} — ${resolved.error}`,
-					{
-						action,
-						teamId,
-						accepted: false,
-						input: modelInput,
-						error: resolved.error,
-						reason: resolved.reason,
-					},
-				);
-			}
-
-			const resolvedModel = formatProviderModel(resolved.value.provider, resolved.value.modelId);
-			const warnSuffix = resolved.value.warnings.length > 0 ? ` [${resolved.value.warnings.join("; ")}]` : "";
-			return compactResult(
-				`Model check accepted: ${modelInput ?? "(none)"} → ${resolvedModel ?? "(teammate default)"} (${describeModelSource(resolved.value.source)})${warnSuffix}`,
-				{
-					action,
-					teamId,
-					accepted: true,
-					input: modelInput,
-					source: resolved.value.source,
-					provider: resolved.value.provider,
-					modelId: resolved.value.modelId,
-					model: resolvedModel,
-					warnings: resolved.value.warnings,
-				},
-			);
-		}
-
-		if (action === "hooks_policy_get") {
-			const configuredFailureAction: TeamsHookFailureAction | undefined = cfg.hooks?.failureAction;
-			const configuredFollowupOwner: TeamsHookFollowupOwnerPolicy | undefined = cfg.hooks?.followupOwner;
-			const configuredMaxReopens = cfg.hooks?.maxReopensPerTask;
-
-			const effectiveFailureAction = getTeamsHookFailureAction(process.env, configuredFailureAction);
-			const effectiveFollowupOwner = getTeamsHookFollowupOwnerPolicy(process.env, configuredFollowupOwner);
-			const effectiveMaxReopens = getTeamsHookMaxReopensPerTask(process.env, configuredMaxReopens);
-
-			const overrides: string[] = [];
-			if (configuredFailureAction) overrides.push("failureAction");
-			if (configuredMaxReopens !== undefined) overrides.push("maxReopensPerTask");
-			if (configuredFollowupOwner) overrides.push("followupOwner");
-			const overrideSuffix = overrides.length > 0 ? ` (team overrides: ${overrides.join(", ")})` : " (all env defaults)";
-
-			return compactResult(
-				`Hooks: failureAction=${effectiveFailureAction}, maxReopens=${String(effectiveMaxReopens)}, followupOwner=${effectiveFollowupOwner}${overrideSuffix}`,
-				{
-					action,
-					teamId,
-					configured: {
-						failureAction: configuredFailureAction,
-						maxReopensPerTask: configuredMaxReopens,
-						followupOwner: configuredFollowupOwner,
-					},
-					effective: {
-						failureAction: effectiveFailureAction,
-						maxReopensPerTask: effectiveMaxReopens,
-						followupOwner: effectiveFollowupOwner,
-					},
-				},
-			);
-		}
-
-		if (action === "hooks_policy_set") {
-			const reset = params.hooksPolicyReset === true;
-			const nextFailureAction = params.hookFailureAction;
-			const nextMaxReopens = params.hookMaxReopensPerTask;
-			const nextFollowupOwner = params.hookFollowupOwner;
-			if (!reset && nextFailureAction === undefined && nextMaxReopens === undefined && nextFollowupOwner === undefined) {
-				return {
-					content: [
-						{
-							type: "text",
-							text: "hooks_policy_set requires at least one policy field (or hooksPolicyReset=true)",
-						},
-					],
-					details: { action, reset },
-				};
-			}
-
-			const updatedCfg = await updateTeamHooksPolicy(teamDir, (current) => {
-				const next = reset ? {} : { ...current };
-				if (nextFailureAction !== undefined) next.failureAction = nextFailureAction;
-				if (nextMaxReopens !== undefined) next.maxReopensPerTask = nextMaxReopens;
-				if (nextFollowupOwner !== undefined) next.followupOwner = nextFollowupOwner;
-				if (
-					next.failureAction === undefined &&
-					next.maxReopensPerTask === undefined &&
-					next.followupOwner === undefined
-				) {
-					return undefined;
-				}
-				return next;
-			});
-			if (!updatedCfg) {
-				return {
-					content: [{ type: "text", text: "Failed to update hooks policy: team config missing" }],
-					details: { action, teamId },
-				};
-			}
-
-			await refreshUi();
-			const configuredFailureAction: TeamsHookFailureAction | undefined = updatedCfg.hooks?.failureAction;
-			const configuredFollowupOwner: TeamsHookFollowupOwnerPolicy | undefined = updatedCfg.hooks?.followupOwner;
-			const configuredMaxReopens = updatedCfg.hooks?.maxReopensPerTask;
-			const effectiveFailureAction = getTeamsHookFailureAction(process.env, configuredFailureAction);
-			const effectiveFollowupOwner = getTeamsHookFollowupOwnerPolicy(process.env, configuredFollowupOwner);
-			const effectiveMaxReopens = getTeamsHookMaxReopensPerTask(process.env, configuredMaxReopens);
-
-			return compactResult(
-				`Updated hooks: failureAction=${effectiveFailureAction}, maxReopens=${String(effectiveMaxReopens)}, followupOwner=${effectiveFollowupOwner}`,
-				{
-					action,
-					teamId,
-					reset,
-					configured: {
-						failureAction: configuredFailureAction,
-						maxReopensPerTask: configuredMaxReopens,
-						followupOwner: configuredFollowupOwner,
-					},
-					effective: {
-						failureAction: effectiveFailureAction,
-						maxReopensPerTask: effectiveMaxReopens,
-						followupOwner: effectiveFollowupOwner,
-					},
-				},
-			);
-		}
-
-		if (action !== "delegate") {
-			return {
-				content: [{ type: "text", text: `Unsupported action: ${String(action)}` }],
-				details: { action },
-			};
-		}
-
-		const inputTasks: TeamsToolDelegateTask[] = params.tasks ?? [];
-		if (inputTasks.length === 0) {
-			return {
-				content: [{ type: "text", text: "No tasks provided. Provide tasks: [{text, assignee?}, ...]" }],
-				details: { action },
-			};
-		}
-
-		const contextMode: ContextMode = params.contextMode === "branch" ? "branch" : "fresh";
-		const requestedWorkspaceMode: WorkspaceMode = params.workspaceMode === "worktree" ? "worktree" : "shared";
-		const modelOverride = params.model?.trim();
-		const spawnModel = modelOverride && modelOverride.length > 0 ? modelOverride : undefined;
-		const spawnThinking = params.thinking;
-
-		let teammateNames: string[] = [];
-		const explicit = params.teammates;
-		if (explicit && explicit.length) {
-			teammateNames = explicit.map((n) => sanitizeName(n)).filter((n) => n.length > 0);
-		}
-
-		if (teammateNames.length === 0 && teammates.size > 0) {
-			teammateNames = Array.from(teammates.keys());
-		}
-
-		if (teammateNames.length === 0) {
-			const maxTeammates = Math.max(1, Math.min(16, params.maxTeammates ?? 4));
-			const count = Math.min(maxTeammates, inputTasks.length);
-			const taken = new Set(teammates.keys());
-			const naming = getTeamsNamingRules(style);
-			teammateNames =
-				naming.autoNameStrategy.kind === "agent"
-					? pickAgentNames(count, taken)
-					: pickNamesFromPool({
-						pool: naming.autoNameStrategy.pool,
-						count,
-						taken,
-						fallbackBase: naming.autoNameStrategy.fallbackBase,
-					});
-		}
-
-		const spawned: string[] = [];
-		const warnings: string[] = [];
-
-		for (const name of teammateNames) {
-			if (signal?.aborted) break;
-			if (teammates.has(name)) continue;
-			const res = await spawnTeammate(ctx, {
-				name,
-				mode: contextMode,
-				workspaceMode: requestedWorkspaceMode,
-				model: spawnModel,
-				thinking: spawnThinking,
-			});
-			if (!res.ok) {
-				warnings.push(`Failed to spawn '${name}': ${res.error}`);
-				continue;
-			}
-			spawned.push(res.name);
-			warnings.push(...res.warnings);
-		}
-
-		const assignments: Array<{ taskId: string; assignee: string; subject: string }> = [];
-		let rr = 0;
-		for (const t of inputTasks) {
-			if (signal?.aborted) break;
-
-			const text = t.text.trim();
-			if (!text) {
-				warnings.push("Skipping empty task");
-				continue;
-			}
-
-			const explicitAssignee = t.assignee ? sanitizeName(t.assignee) : undefined;
-			const assignee = explicitAssignee ?? teammateNames[rr++ % teammateNames.length];
-			if (!assignee) {
-				warnings.push(`No assignee available for task: ${text.slice(0, 60)}`);
-				continue;
-			}
-
-			if (!teammates.has(assignee)) {
-				const res = await spawnTeammate(ctx, {
-					name: assignee,
-					mode: contextMode,
-					workspaceMode: requestedWorkspaceMode,
-					model: spawnModel,
-					thinking: spawnThinking,
-				});
-				if (res.ok) {
-					spawned.push(res.name);
-					warnings.push(...res.warnings);
-				} else {
-					warnings.push(`Failed to spawn assignee '${assignee}': ${res.error}`);
-					continue;
-				}
-			}
-
-			const description = text;
-			const firstLine = description.split("\n").at(0) ?? "";
-			const subject = firstLine.slice(0, 120);
-			const task = await createTask(teamDir, effectiveTlId, { subject, description, owner: assignee });
-
-			await writeToMailbox(teamDir, effectiveTlId, assignee, {
-				from: cfg.leadName,
-				text: JSON.stringify(taskAssignmentPayload(task, cfg.leadName)),
-				timestamp: new Date().toISOString(),
-			});
-
-			assignments.push({ taskId: task.id, assignee, subject });
-		}
-
-		void refreshTasks().finally(renderWidget);
-
-		const lines: string[] = [];
-		lines.push(`Delegated ${assignments.length} task(s):`);
-		lines.push(...summarizeTaskAssignments(assignments, style));
-		if (spawned.length) lines.push(`Spawned: ${spawned.join(", ")}.`);
-		if (warnings.length) lines.push(`Warnings: ${warnings.join("; ")}`);
-
-		return compactResult(lines.join("\n"), {
-			action,
-			teamId,
-			taskListId: effectiveTlId,
-			contextMode,
-			workspaceMode: requestedWorkspaceMode,
-			model: spawnModel,
-			thinking: spawnThinking,
-			spawned,
-			assignments,
-			warnings,
-		});
-	}
 }

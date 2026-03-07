@@ -7,11 +7,27 @@ import type { TeamsStyle } from "./teams-style.js";
 import { formatMemberDisplayName } from "./teams-style.js";
 
 // ---------------------------------------------------------------------------
-// Stale-action classification
+// Tool name + stale-action classification
 // ---------------------------------------------------------------------------
 
-/** Actions whose tool results become stale once newer teams results exist. */
-const STALE_ACTIONS = new Set([
+/** All tool names registered by the teams extension (including legacy). */
+const TEAMS_TOOL_NAMES = new Set([
+	"teams_delegate",
+	"teams_task",
+	"teams_message",
+	"teams_member",
+	"teams_policy",
+	"teams", // legacy shim
+]);
+
+/** Tools whose results are always stale (every action mutates state). */
+const ALWAYS_STALE_TOOLS = new Set(["teams_delegate", "teams_message", "teams_member"]);
+
+/** For teams_task, only these actions are stale (dep_ls is a read). */
+const STALE_TASK_ACTIONS = new Set(["assign", "unassign", "set_status", "dep_add", "dep_rm"]);
+
+/** Legacy stale actions for the old "teams" tool. */
+const LEGACY_STALE_ACTIONS = new Set([
 	"delegate",
 	"task_assign",
 	"task_unassign",
@@ -26,6 +42,13 @@ const STALE_ACTIONS = new Set([
 	"member_kill",
 	"member_prune",
 ]);
+
+function isStaleTeamsResult(toolName: string, action: string | undefined): boolean {
+	if (toolName === "teams") return action !== undefined && LEGACY_STALE_ACTIONS.has(action);
+	if (ALWAYS_STALE_TOOLS.has(toolName)) return true;
+	if (toolName === "teams_task") return action !== undefined && STALE_TASK_ACTIONS.has(action);
+	return false; // teams_policy is never stale
+}
 
 /** Always keep the last N teams tool results regardless of staleness. */
 const KEEP_RECENT_TOOL_RESULTS = 6;
@@ -91,21 +114,22 @@ export function buildTeamStateSnapshot(
 // ---------------------------------------------------------------------------
 
 /**
- * Build a mapping from toolCallId → action by scanning assistant messages
- * for tool calls targeting the "teams" tool.
+ * Build a mapping from toolCallId → { toolName, action } by scanning
+ * assistant messages for tool calls targeting any teams tool.
  */
-function buildToolCallActionMap(messages: AgentMessage[]): Map<string, string> {
-	const map = new Map<string, string>();
+function buildToolCallActionMap(messages: AgentMessage[]): Map<string, { toolName: string; action?: string }> {
+	const map = new Map<string, { toolName: string; action?: string }>();
 	for (const msg of messages) {
 		if ((msg as AssistantMessage).role !== "assistant") continue;
 		const assistant = msg as AssistantMessage;
 		for (const block of assistant.content) {
 			if (block.type !== "toolCall") continue;
-			if (block.name !== "teams") continue;
+			if (!TEAMS_TOOL_NAMES.has(block.name)) continue;
 			const action = block.arguments?.action;
-			if (typeof action === "string") {
-				map.set(block.id, action);
-			}
+			map.set(block.id, {
+				toolName: block.name,
+				action: typeof action === "string" ? action : undefined,
+			});
 		}
 	}
 	return map;
@@ -130,9 +154,9 @@ export function filterStaleTeamsResults(
 	for (let i = 0; i < messages.length; i++) {
 		const msg = messages[i] as ToolResultMessage;
 		if (msg.role !== "toolResult") continue;
-		if (msg.toolName !== "teams") continue;
-		const action = actionMap.get(msg.toolCallId);
-		if (action && STALE_ACTIONS.has(action)) {
+		if (!TEAMS_TOOL_NAMES.has(msg.toolName)) continue;
+		const info = actionMap.get(msg.toolCallId);
+		if (info && isStaleTeamsResult(info.toolName, info.action)) {
 			staleEligibleIndices.push(i);
 		}
 	}

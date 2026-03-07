@@ -5,27 +5,24 @@ description: "Coordinate multi-agent teamwork with shared task lists, mailbox me
 
 # Agent Teams (Quick Reference)
 
-You are the **leader** agent. Use the `teams` tool to delegate, manage tasks, message teammates, and handle lifecycle/policy.
+You are the **leader** agent. Use the teams tools to delegate, manage tasks, message teammates, and handle lifecycle/policy.
 
 ## Core concepts
 
-- **Leader** (you): orchestrates, delegates, reviews. Runs the `/team` command and the `teams` LLM tool.
+- **Leader** (you): orchestrates, delegates, reviews. Runs the `/team` command and the teams LLM tools.
 - **Teammates**: child Pi processes that poll for tasks, execute them, and report back. Sessions are named `pi agent teams - <role> <name>` where `<role>` depends on the current style (e.g. teammate/comrade/matey).
 - **Task list**: file-per-task store with statuses (pending/in_progress/completed), owners, and dependency tracking.
 - **Mailbox**: file-based message queue. Two namespaces: `team` (DMs, notifications, shutdown) and `taskListId` (task assignments).
 
-## Key actions
+## Tools
 
-| Action | Purpose |
-|--------|---------|
-| `delegate` | Spawn + assign tasks (primary workflow) |
-| `task_assign` / `task_unassign` / `task_set_status` | Task mutations |
-| `task_dep_add` / `task_dep_rm` / `task_dep_ls` | Dependency graph |
-| `message_dm` / `message_broadcast` / `message_steer` | Communication |
-| `member_spawn` / `member_shutdown` / `member_kill` | Lifecycle |
-| `plan_approve` / `plan_reject` | Governance |
-| `hooks_policy_get` / `hooks_policy_set` | Quality gates |
-| `model_policy_get` / `model_policy_check` | Model selection |
+| Tool | Purpose |
+|------|---------|
+| `teams_delegate` | Spawn + assign tasks (primary workflow) |
+| `teams_task` | assign, unassign, set_status, dep_add, dep_rm, dep_ls |
+| `teams_message` | dm, broadcast, steer |
+| `teams_member` | spawn, shutdown, kill, prune |
+| `teams_policy` | hooks_get, hooks_set, model_get, model_check, plan_approve, plan_reject |
 
 ## Defaults
 

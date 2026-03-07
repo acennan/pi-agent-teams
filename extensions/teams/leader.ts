@@ -31,6 +31,11 @@ import {
 } from "./hooks.js";
 import { handleTeamCommand } from "./leader-team-command.js";
 import { registerTeamsTool } from "./leader-teams-tool.js";
+import { registerTeamsDelegateTool } from "./leader-tool-delegate.js";
+import { registerTeamsTaskTool } from "./leader-tool-task.js";
+import { registerTeamsMessageTool } from "./leader-tool-message.js";
+import { registerTeamsMemberTool } from "./leader-tool-member.js";
+import { registerTeamsPolicyTool } from "./leader-tool-policy.js";
 import { buildTeamCompactionInstructions } from "./leader-compaction.js";
 import { buildTeamStateSnapshot, filterStaleTeamsResults } from "./leader-context-filter.js";
 import type { ContextMode, SpawnTeammateFn, SpawnTeammateResult, WorkspaceMode } from "./spawn-types.js";
@@ -768,18 +773,24 @@ export function runLeader(pi: ExtensionAPI): void {
 		await stopAllTeammates(currentCtx, `The ${strings.teamNoun} is over`);
 	});
 
-	registerTeamsTool({
+	const toolOpts = {
 		pi,
 		teammates,
 		spawnTeammate,
-		getTeamId: (ctx) => currentTeamId ?? ctx.sessionManager.getSessionId(),
+		getTeamId: (ctx: Parameters<typeof spawnTeammate>[0]) => currentTeamId ?? ctx.sessionManager.getSessionId(),
 		getTaskListId: () => taskListId,
 		refreshTasks,
 		renderWidget,
 		pendingPlanApprovals,
 		getContextUsage: () => currentCtx?.getContextUsage(),
 		triggerCompaction: tryCompact,
-	});
+	};
+	registerTeamsDelegateTool(toolOpts);
+	registerTeamsTaskTool(toolOpts);
+	registerTeamsMessageTool(toolOpts);
+	registerTeamsMemberTool(toolOpts);
+	registerTeamsPolicyTool(toolOpts);
+	registerTeamsTool(toolOpts); // legacy shim for resumed sessions
 
 	// Summarize-on-completion: replace stale teams tool results with a compact
 	// state snapshot before each LLM call. This keeps the persisted session

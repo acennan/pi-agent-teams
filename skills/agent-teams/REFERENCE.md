@@ -15,44 +15,72 @@ Custom styles can be added via JSON files under `~/.pi/agent/teams/_styles/<styl
 
 - `/team style init <name> [extends <base>]`
 
-## Tool action reference
+## Tool reference
 
-Use the **`teams` tool** (LLM-callable) for delegation, task/messaging mutations, lifecycle, and governance:
+The teams extension provides 5 focused LLM-callable tools:
+
+### `teams_delegate` — Delegate tasks
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `tasks` | yes | Array of `{ text, assignee? }`. Spawns teammates as needed, assigns round-robin. |
+| `teammates` | no | Explicit teammate names to use/spawn. |
+| `maxTeammates` | no | Max auto-spawned teammates (default 4). |
+| `contextMode` | no | `fresh` (default) or `branch`. |
+| `workspaceMode` | no | `shared` (default) or `worktree`. |
+| `model` | no | `<provider>/<modelId>` override. |
+| `thinking` | no | off/minimal/low/medium/high/xhigh. |
+
+### `teams_task` — Task mutations
 
 | Action | Required fields | Notes |
 | --- | --- | --- |
-| `delegate` | `tasks` | Spawns as needed, creates and assigns tasks. |
-| `task_assign` | `taskId`, `assignee` | Assign/reassign owner. |
-| `task_unassign` | `taskId` | Clear owner. |
-| `task_set_status` | `taskId`, `status` | `pending` \| `in_progress` \| `completed`. |
-| `task_dep_add` / `task_dep_rm` | `taskId`, `depId` | Dependency graph edits. |
-| `task_dep_ls` | `taskId` | Dependency/block inspection. |
-| `message_dm` | `name`, `message` | Mailbox DM. |
-| `message_broadcast` | `message` | Mailbox broadcast. |
-| `message_steer` | `name`, `message` | RPC steer for running teammate. |
-| `member_spawn` | `name` | Supports context/workspace/model/thinking/plan options. |
-| `member_shutdown` | `name` or `all=true` | Graceful mailbox shutdown request. |
-| `member_kill` | `name` | Force-stop RPC teammate. |
-| `member_prune` | _(none)_ | Mark stale workers offline (`all=true` to force). |
+| `assign` | `taskId`, `assignee` | Assign/reassign owner. |
+| `unassign` | `taskId` | Clear owner. |
+| `set_status` | `taskId`, `status` | `pending` \| `in_progress` \| `completed`. |
+| `dep_add` / `dep_rm` | `taskId`, `depId` | Dependency graph edits. |
+| `dep_ls` | `taskId` | Dependency/block inspection. |
+
+### `teams_message` — Communication
+
+| Action | Required fields | Notes |
+| --- | --- | --- |
+| `dm` | `name`, `message` | Mailbox DM. |
+| `broadcast` | `message` | Mailbox broadcast. |
+| `steer` | `name`, `message` | RPC steer for running teammate. |
+
+### `teams_member` — Lifecycle
+
+| Action | Required fields | Notes |
+| --- | --- | --- |
+| `spawn` | `name` | Supports context/workspace/model/thinking/plan options. |
+| `shutdown` | `name` or `all=true` | Graceful mailbox shutdown request. |
+| `kill` | `name` | Force-stop RPC teammate. |
+| `prune` | _(none)_ | Mark stale workers offline (`all=true` to force). |
+
+### `teams_policy` — Governance & policy
+
+| Action | Required fields | Notes |
+| --- | --- | --- |
 | `plan_approve` / `plan_reject` | `name` | Resolve pending plan approvals (`feedback` optional for reject). |
-| `hooks_policy_get` | _(none)_ | Read team hooks policy (configured + effective). |
-| `hooks_policy_set` | one or more: `hookFailureAction`, `hookMaxReopensPerTask`, `hookFollowupOwner` | Update team hooks policy at runtime (`hooksPolicyReset=true` clears team overrides first). |
-| `model_policy_get` | _(none)_ | Inspect teammate model policy and current leader inheritance behavior. |
-| `model_policy_check` | optional `model` | Validate a model override before spawn (`<provider>/<modelId>` or `<modelId>`). |
+| `hooks_get` | _(none)_ | Read team hooks policy (configured + effective). |
+| `hooks_set` | one or more: `hookFailureAction`, `hookMaxReopensPerTask`, `hookFollowupOwner` | Update hooks policy (`hooksPolicyReset=true` clears overrides first). |
+| `model_get` | _(none)_ | Inspect teammate model policy. |
+| `model_check` | optional `model` | Validate a model override before spawn. |
 
 ### Tool examples
 
 ```
-teams({ action: "delegate", tasks: [{ text: "Implement auth", assignee: "alice" }] })
-teams({ action: "task_assign", taskId: "12", assignee: "alice" })
-teams({ action: "task_dep_add", taskId: "12", depId: "7" })
-teams({ action: "message_broadcast", message: "Sync: finishing this milestone" })
-teams({ action: "member_kill", name: "alice" })
-teams({ action: "plan_reject", name: "alice", feedback: "Include rollback strategy" })
-teams({ action: "hooks_policy_get" })
-teams({ action: "hooks_policy_set", hookFailureAction: "reopen_followup", hookMaxReopensPerTask: 2, hookFollowupOwner: "member" })
-teams({ action: "model_policy_get" })
-teams({ action: "model_policy_check", model: "openai-codex/gpt-5.1-codex-mini" })
+teams_delegate({ tasks: [{ text: "Implement auth", assignee: "alice" }] })
+teams_task({ action: "assign", taskId: "12", assignee: "alice" })
+teams_task({ action: "dep_add", taskId: "12", depId: "7" })
+teams_message({ action: "broadcast", message: "Sync: finishing this milestone" })
+teams_member({ action: "kill", name: "alice" })
+teams_policy({ action: "plan_reject", name: "alice", feedback: "Include rollback strategy" })
+teams_policy({ action: "hooks_get" })
+teams_policy({ action: "hooks_set", hookFailureAction: "reopen_followup", hookMaxReopensPerTask: 2, hookFollowupOwner: "member" })
+teams_policy({ action: "model_get" })
+teams_policy({ action: "model_check", model: "openai-codex/gpt-5.1-codex-mini" })
 ```
 
 This covers most day-to-day orchestration without slash commands. For nuanced/manual control, use `/team ...` commands directly.
