@@ -45,13 +45,42 @@ function compactResult(text: string, details: unknown): AgentToolResult<unknown>
 	};
 }
 
-/** Summarize a list of names: inline if ≤3, otherwise just show the count. */
-function summarizeNames(names: string[], style: TeamsStyle, memberTitle: string): string {
-	if (names.length === 0) return `0 ${memberTitle}(s)`;
-	if (names.length <= 3) {
-		return `${names.length} ${memberTitle}(s): ${names.map((n) => formatMemberDisplayName(style, n)).join(", ")}`;
+/** Threshold at which lists are summarized instead of fully enumerated. */
+const LIST_THRESHOLD = 4;
+
+/** Summarize a list of names: inline if ≤ threshold, otherwise show first 3 + "+N more". */
+function summarizeNameList(names: string[], style: TeamsStyle, noun: string): string {
+	if (names.length === 0) return `0 ${noun}(s)`;
+	if (names.length <= LIST_THRESHOLD) {
+		return `${names.length} ${noun}(s): ${names.map((n) => formatMemberDisplayName(style, n)).join(", ")}`;
 	}
-	return `${names.length} ${memberTitle}(s)`;
+	const shown = names.slice(0, 3).map((n) => formatMemberDisplayName(style, n)).join(", ");
+	return `${names.length} ${noun}(s): ${shown}, +${names.length - 3} more`;
+}
+
+/** Summarize task assignments: full list if ≤ threshold, otherwise grouped by assignee. */
+function summarizeTaskAssignments(
+	assignments: Array<{ taskId: string; assignee: string; subject: string }>,
+	style: TeamsStyle,
+): string[] {
+	const lines: string[] = [];
+	if (assignments.length <= LIST_THRESHOLD) {
+		for (const a of assignments) {
+			lines.push(`#${a.taskId} → ${formatMemberDisplayName(style, a.assignee)}: ${a.subject}`);
+		}
+	} else {
+		// Group by assignee for compact output
+		const byAssignee = new Map<string, string[]>();
+		for (const a of assignments) {
+			const ids = byAssignee.get(a.assignee) ?? [];
+			ids.push(`#${a.taskId}`);
+			byAssignee.set(a.assignee, ids);
+		}
+		for (const [assignee, ids] of byAssignee) {
+			lines.push(`${formatMemberDisplayName(style, assignee)}: ${ids.join(", ")}`);
+		}
+	}
+	return lines;
 }
 
 function describeModelSource(source: TeammateModelSource): string {
@@ -364,13 +393,19 @@ export function registerTeamsTool(opts: {
 				lines.push(`#${task.id} ${task.subject}`);
 				lines.push(`${blocked ? "blocked" : "unblocked"} • deps:${task.blockedBy.length} • blocks:${task.blocks.length}`);
 				lines.push("");
+				const MAX_DEPS = 6;
+
 				lines.push("blockedBy:");
 				if (task.blockedBy.length === 0) {
 					lines.push("  (none)");
 				} else {
-					for (const id of task.blockedBy) {
+					const depsToShow = task.blockedBy.slice(0, MAX_DEPS);
+					for (const id of depsToShow) {
 						const dep = byId.get(id) ?? (await getTask(teamDir, effectiveTlId, id));
 						lines.push(dep ? `  - #${id} ${dep.status} ${dep.subject}` : `  - #${id} (missing)`);
+					}
+					if (task.blockedBy.length > MAX_DEPS) {
+						lines.push(`  ... +${task.blockedBy.length - MAX_DEPS} more`);
 					}
 				}
 				lines.push("");
@@ -378,9 +413,13 @@ export function registerTeamsTool(opts: {
 				if (task.blocks.length === 0) {
 					lines.push("  (none)");
 				} else {
-					for (const id of task.blocks) {
+					const blocksToShow = task.blocks.slice(0, MAX_DEPS);
+					for (const id of blocksToShow) {
 						const child = byId.get(id) ?? (await getTask(teamDir, effectiveTlId, id));
 						lines.push(child ? `  - #${id} ${child.status} ${child.subject}` : `  - #${id} (missing)`);
+					}
+					if (task.blocks.length > MAX_DEPS) {
+						lines.push(`  ... +${task.blocks.length - MAX_DEPS} more`);
 					}
 				}
 
@@ -443,7 +482,7 @@ export function registerTeamsTool(opts: {
 					),
 				);
 				return compactResult(
-					`Broadcast queued for ${summarizeNames(names, style, strings.memberTitle.toLowerCase())}`,
+					`Broadcast queued for ${summarizeNameList(names, style, strings.memberTitle.toLowerCase())}`,
 					{ action, teamId, recipients: names, mailboxNamespace: TEAM_MAILBOX_NS },
 				);
 			}
@@ -600,7 +639,7 @@ export function registerTeamsTool(opts: {
 
 				await refreshUi();
 				return compactResult(
-					`Shutdown requested for ${summarizeNames(names, style, strings.memberTitle.toLowerCase())}`,
+					`Shutdown requested for ${summarizeNameList(names, style, strings.memberTitle.toLowerCase())}`,
 					{ action, teamId, names, all, reason },
 				);
 			}
@@ -643,7 +682,7 @@ export function registerTeamsTool(opts: {
 					);
 				}
 				return compactResult(
-					`Pruned ${summarizeNames(pruned, style, `stale ${strings.memberTitle.toLowerCase()}`)}`,
+					`Pruned ${summarizeNameList(pruned, style, `stale ${strings.memberTitle.toLowerCase()}`)}`,
 					{ action, teamId, pruned },
 				);
 			}
@@ -1024,17 +1063,12 @@ export function registerTeamsTool(opts: {
 			void refreshTasks().finally(renderWidget);
 
 			const lines: string[] = [];
-			const taskIds = assignments.map((a) => `#${a.taskId}`);
-			const assigneeCounts = new Map<string, number>();
-			for (const a of assignments) assigneeCounts.set(a.assignee, (assigneeCounts.get(a.assignee) ?? 0) + 1);
-			const assigneeSummary = Array.from(assigneeCounts.entries()).map(([n, c]) => `${n}×${c}`).join(", ");
-
-			lines.push(`Delegated ${assignments.length} task(s) to ${assigneeCounts.size} teammate(s) (${assigneeSummary}).`);
-			lines.push(`Task IDs: ${taskIds.join(", ")}.`);
+			lines.push(`Delegated ${assignments.length} task(s):`);
+			lines.push(...summarizeTaskAssignments(assignments, style));
 			if (spawned.length) lines.push(`Spawned: ${spawned.join(", ")}.`);
 			if (warnings.length) lines.push(`Warnings: ${warnings.join("; ")}`);
 
-			return compactResult(lines.join(" "), {
+			return compactResult(lines.join("\n"), {
 				action,
 				teamId,
 				taskListId: effectiveTlId,
