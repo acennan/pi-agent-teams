@@ -19,7 +19,7 @@ import { executeDelegateAction } from "./leader-tool-delegate.js";
 import { executeTaskAction } from "./leader-tool-task.js";
 import { executeMessageAction } from "./leader-tool-message.js";
 import { executeMemberAction } from "./leader-tool-member.js";
-import { executePolicyAction } from "./leader-tool-policy.js";
+import { executePolicyAction, POLICY_ACTIONS } from "./leader-tool-policy.js";
 
 // ---------------------------------------------------------------------------
 // Legacy schema — kept minimal to reduce token overhead.
@@ -88,14 +88,27 @@ type LegacyParams = Static<typeof LegacyParamsSchema>;
 const TASK_PREFIX = "task_";
 const MESSAGE_PREFIX = "message_";
 const MEMBER_PREFIX = "member_";
-const POLICY_REMAP: Record<string, string> = {
-	hooks_policy_get: "hooks_get",
-	hooks_policy_set: "hooks_set",
-	model_policy_get: "model_get",
-	model_policy_check: "model_check",
-	plan_approve: "plan_approve",
-	plan_reject: "plan_reject",
-};
+/**
+ * Derive the legacy→new policy action mapping programmatically from
+ * `POLICY_ACTIONS` (exported by `leader-tool-policy.ts`).
+ *
+ * Legacy names used `hooks_policy_*` / `model_policy_*` prefixes; the new
+ * canonical names drop `_policy` (e.g. `hooks_get`). Actions without a
+ * `_policy` legacy prefix (like `plan_approve`) map to themselves.
+ */
+const LEGACY_PREFIX_MAP: Record<string, string> = { hooks: "hooks_policy", model: "model_policy" };
+const POLICY_REMAP: Record<string, string> = Object.fromEntries(
+	POLICY_ACTIONS.flatMap((action) => {
+		const entries: [string, string][] = [[action, action]]; // identity (new name always works)
+		for (const [prefix, legacyPrefix] of Object.entries(LEGACY_PREFIX_MAP)) {
+			if (action.startsWith(`${prefix}_`)) {
+				const legacyAction = action.replace(`${prefix}_`, `${legacyPrefix}_`);
+				entries.push([legacyAction, action]);
+			}
+		}
+		return entries;
+	}),
+);
 
 // ---------------------------------------------------------------------------
 // Registration

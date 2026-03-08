@@ -18,6 +18,7 @@ import { taskAssignmentPayload } from "./protocol.js";
 import {
 	type TeamToolOpts,
 	resolveTeamToolContext,
+	compactResult,
 	appendContextWarning,
 } from "./leader-tool-shared.js";
 
@@ -60,67 +61,43 @@ export async function executeTaskAction(
 		const taskId = params.taskId?.trim();
 		const status = params.status;
 		if (!taskId || !status) {
-			return {
-				content: [{ type: "text", text: "set_status requires taskId and status" }],
-				details: { action, taskId, status },
-			};
+			return compactResult("set_status requires taskId and status", { action, taskId, status });
 		}
 
 		const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyStatusChange(cur, status));
 		if (!updated) {
-			return {
-				content: [{ type: "text", text: `Task not found: ${taskId}` }],
-				details: { action, taskId, status },
-			};
+			return compactResult(`Task not found: ${taskId}`, { action, taskId, status });
 		}
 
 		await refreshUi();
-		return {
-			content: [{ type: "text", text: `Updated task #${updated.id}: status=${updated.status}` }],
-			details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id, status: updated.status },
-		};
+		return compactResult(`Updated task #${updated.id}: status=${updated.status}`, { action, teamId, taskListId: effectiveTlId, taskId: updated.id, status: updated.status });
 	}
 
 	if (action === "unassign") {
 		const taskId = params.taskId?.trim();
 		if (!taskId) {
-			return {
-				content: [{ type: "text", text: "unassign requires taskId" }],
-				details: { action },
-			};
+			return compactResult("unassign requires taskId", { action });
 		}
 
 		const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyUnassign(cur, cfg.leadName, "teams-tool"));
 		if (!updated) {
-			return {
-				content: [{ type: "text", text: `Task not found: ${taskId}` }],
-				details: { action, taskId },
-			};
+			return compactResult(`Task not found: ${taskId}`, { action, taskId });
 		}
 
 		await refreshUi();
-		return {
-			content: [{ type: "text", text: `Unassigned task #${updated.id}` }],
-			details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id },
-		};
+		return compactResult(`Unassigned task #${updated.id}`, { action, teamId, taskListId: effectiveTlId, taskId: updated.id });
 	}
 
 	if (action === "assign") {
 		const taskId = params.taskId?.trim();
 		const assignee = sanitizeName(params.assignee ?? "");
 		if (!taskId || !assignee) {
-			return {
-				content: [{ type: "text", text: "assign requires taskId and assignee" }],
-				details: { action, taskId, assignee: params.assignee },
-			};
+			return compactResult("assign requires taskId and assignee", { action, taskId, assignee: params.assignee });
 		}
 
 		const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyReassign(cur, assignee, cfg.leadName));
 		if (!updated) {
-			return {
-				content: [{ type: "text", text: `Task not found: ${taskId}` }],
-				details: { action, taskId, assignee },
-			};
+			return compactResult(`Task not found: ${taskId}`, { action, taskId, assignee });
 		}
 
 		await writeToMailbox(teamDir, effectiveTlId, assignee, {
@@ -130,20 +107,14 @@ export async function executeTaskAction(
 		});
 
 		await refreshUi();
-		return {
-			content: [{ type: "text", text: `Assigned task #${updated.id} to ${formatMemberDisplayName(style, assignee)}` }],
-			details: { action, teamId, taskListId: effectiveTlId, taskId: updated.id, assignee },
-		};
+		return compactResult(`Assigned task #${updated.id} to ${formatMemberDisplayName(style, assignee)}`, { action, teamId, taskListId: effectiveTlId, taskId: updated.id, assignee });
 	}
 
 	if (action === "dep_add" || action === "dep_rm") {
 		const taskId = params.taskId?.trim();
 		const depId = params.depId?.trim();
 		if (!taskId || !depId) {
-			return {
-				content: [{ type: "text", text: `${action} requires taskId and depId` }],
-				details: { action, taskId, depId },
-			};
+			return compactResult(`${action} requires taskId and depId`, { action, taskId, depId });
 		}
 
 		const res =
@@ -151,42 +122,25 @@ export async function executeTaskAction(
 				? await addTaskDependency(teamDir, effectiveTlId, taskId, depId)
 				: await removeTaskDependency(teamDir, effectiveTlId, taskId, depId);
 		if (!res.ok) {
-			return {
-				content: [{ type: "text", text: res.error }],
-				details: { action, taskId, depId, error: res.error },
-			};
+			return compactResult(res.error, { action, taskId, depId, error: res.error });
 		}
 
 		await refreshUi();
-		return {
-			content: [
-				{
-					type: "text",
-					text:
-						action === "dep_add"
-							? `Added dependency: #${taskId} depends on #${depId}`
-							: `Removed dependency: #${taskId} no longer depends on #${depId}`,
-				},
-			],
-			details: { action, teamId, taskListId: effectiveTlId, taskId, depId },
-		};
+		const text = action === "dep_add"
+			? `Added dependency: #${taskId} depends on #${depId}`
+			: `Removed dependency: #${taskId} no longer depends on #${depId}`;
+		return compactResult(text, { action, teamId, taskListId: effectiveTlId, taskId, depId });
 	}
 
 	if (action === "dep_ls") {
 		const taskId = params.taskId?.trim();
 		if (!taskId) {
-			return {
-				content: [{ type: "text", text: "dep_ls requires taskId" }],
-				details: { action },
-			};
+			return compactResult("dep_ls requires taskId", { action });
 		}
 
 		const task = await getTask(teamDir, effectiveTlId, taskId);
 		if (!task) {
-			return {
-				content: [{ type: "text", text: `Task not found: ${taskId}` }],
-				details: { action, taskId },
-			};
+			return compactResult(`Task not found: ${taskId}`, { action, taskId });
 		}
 		const blocked = task.status !== "completed" && (await isTaskBlocked(teamDir, effectiveTlId, task));
 		const all = await listTasks(teamDir, effectiveTlId);
@@ -227,16 +181,10 @@ export async function executeTaskAction(
 			}
 		}
 
-		return {
-			content: [{ type: "text", text: lines.join("\n") }],
-			details: { action, teamId, taskListId: effectiveTlId, taskId, blocked },
-		};
+		return compactResult(lines.join("\n"), { action, teamId, taskListId: effectiveTlId, taskId, blocked });
 	}
 
-	return {
-		content: [{ type: "text", text: `Unsupported task action: ${String(action)}` }],
-		details: { action },
-	};
+	return compactResult(`Unsupported task action: ${String(action)}`, { action });
 }
 
 // ---------------------------------------------------------------------------

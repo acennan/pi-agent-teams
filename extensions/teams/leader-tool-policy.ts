@@ -31,8 +31,11 @@ import {
 // Schema
 // ---------------------------------------------------------------------------
 
+/** Canonical policy action names — also referenced by `POLICY_REMAP` in `leader-teams-tool.ts`. */
+export const POLICY_ACTIONS = ["hooks_get", "hooks_set", "model_get", "model_check", "plan_approve", "plan_reject"] as const;
+
 const PolicyActionSchema = StringEnum(
-	["hooks_get", "hooks_set", "model_get", "model_check", "plan_approve", "plan_reject"] as const,
+	POLICY_ACTIONS,
 	{ description: "Policy action.", default: "hooks_get" },
 );
 
