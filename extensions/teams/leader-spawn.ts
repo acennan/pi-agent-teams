@@ -19,6 +19,7 @@ import { ActivityTracker, TranscriptTracker } from "./activity-tracker.js";
 import { resolveTeammateModelSelection, formatProviderModel } from "./model-policy.js";
 import { formatMemberDisplayName, getTeamsStrings, type TeamsStyle } from "./teams-style.js";
 import type { ContextMode, SpawnTeammateOptions, SpawnTeammateResult, WorkspaceMode } from "./spawn-types.js";
+import { fireAndForget } from "./fire-and-forget.js";
 
 // ---------------------------------------------------------------------------
 // Built-in tool set (hoisted to module scope per audit recommendation 3.2)
@@ -36,6 +37,7 @@ export interface SpawnContext {
 	tracker: ActivityTracker;
 	transcriptTracker: TranscriptTracker;
 	teammateEventUnsubs: Map<string, () => void>;
+	getCurrentCtx: () => ExtensionContext | null;
 	getCurrentTeamId: () => string | null;
 	getTaskListId: () => string | null;
 	getStyle: () => TeamsStyle;
@@ -74,16 +76,20 @@ function handleTeammateClose(
 	transcriptTracker.reset(name);
 
 	if (getCurrentTeamId() !== leaderTeamId) return;
+	const ctx = spawnCtx.getCurrentCtx();
 	const effectiveTlId = getTaskListId() ?? leaderTeamId;
-	void unassignTasksForAgent(
-		teamDir,
-		effectiveTlId,
-		name,
-		`${formatMemberDisplayName(style, name)} ${getTeamsStrings(style).leftVerb}`,
-	).finally(() => {
-		void refreshTasks().finally(renderWidget);
-	});
-	void setMemberStatus(teamDir, name, "offline", { meta: { exitCode: code ?? undefined } });
+	fireAndForget(
+		unassignTasksForAgent(
+			teamDir,
+			effectiveTlId,
+			name,
+			`${formatMemberDisplayName(style, name)} ${getTeamsStrings(style).leftVerb}`,
+		).finally(() => {
+			fireAndForget(refreshTasks().finally(renderWidget), ctx);
+		}),
+		ctx,
+	);
+	fireAndForget(setMemberStatus(teamDir, name, "offline", { meta: { exitCode: code ?? undefined } }), ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -227,8 +233,8 @@ export async function spawnTeammateImpl(
 			text: JSON.stringify({ type: "set_session_name", name: sessionName, from: "team-lead", timestamp: ts }),
 			timestamp: ts,
 		});
-	} catch {
-		// ignore
+	} catch (err: unknown) {
+		ctx.ui.notify(`Failed to send session name to ${name} via mailbox: ${err instanceof Error ? err.message : String(err)}`, "warning");
 	}
 
 	await ensureTeamConfig(teamDir, { teamId, taskListId: taskListId ?? teamId, leadName: "team-lead", style });

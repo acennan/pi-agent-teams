@@ -193,8 +193,8 @@ export async function pollLeaderInbox(opts: {
 							}),
 							timestamp: ts,
 						});
-					} catch {
-						// ignore
+					} catch (err: unknown) {
+						ctx.ui.notify(`Failed to send session name to ${name}: ${err instanceof Error ? err.message : String(err)}`, "warning");
 					}
 				}
 

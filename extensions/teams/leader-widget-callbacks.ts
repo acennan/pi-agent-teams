@@ -17,6 +17,7 @@ import { formatMemberDisplayName, getTeamsStrings, type TeamsStyle } from "./tea
 import type { ActivityTracker, TranscriptLog, TranscriptTracker } from "./activity-tracker.js";
 import type { TeamConfig } from "./team-config.js";
 import type { InteractiveWidgetDeps } from "./teams-panel.js";
+import { fireAndForget } from "./fire-and-forget.js";
 
 // ---------------------------------------------------------------------------
 // Closure state the callbacks need access to
@@ -91,20 +92,20 @@ export function buildWidgetCallbacks(wctx: WidgetCallbackContext): InteractiveWi
 
 		abortMember(name: string) {
 			const rpc = teammates.get(name);
-			if (rpc) void rpc.abort();
+			if (rpc) fireAndForget(rpc.abort(), ctx);
 		},
 
 		killMember(name: string) {
 			const rpc = teammates.get(name);
 			if (!rpc) return;
 
-			void rpc.stop();
+			fireAndForget(rpc.stop(), ctx);
 			teammates.delete(name);
 
 			const displayName = formatMemberDisplayName(getStyle(), name);
-			void unassignTasksForAgent(teamDir, taskListId, name, `${displayName} ${strings.killedVerb}`);
-			void setMemberStatus(teamDir, name, "offline", { meta: { killedAt: new Date().toISOString() } });
-			void refreshTasks();
+			fireAndForget(unassignTasksForAgent(teamDir, taskListId, name, `${displayName} ${strings.killedVerb}`), ctx);
+			fireAndForget(setMemberStatus(teamDir, name, "offline", { meta: { killedAt: new Date().toISOString() } }), ctx);
+			fireAndForget(refreshTasks(), ctx);
 		},
 
 		async setTaskStatus(taskIdArg: string, status: TeamTask["status"]) {

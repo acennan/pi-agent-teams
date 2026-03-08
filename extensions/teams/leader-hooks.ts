@@ -54,7 +54,7 @@ export function buildFailureSummary(res: TeamsHookRunResult): string {
 // ---------------------------------------------------------------------------
 
 /** Persist a hook invocation + result to the team's hook-logs directory. */
-export async function persistHookLog(invocation: TeamsHookInvocation, res: TeamsHookRunResult): Promise<void> {
+export async function persistHookLog(invocation: TeamsHookInvocation, res: TeamsHookRunResult, ctx?: ExtensionContext | null): Promise<void> {
 	try {
 		const logsDir = path.join(invocation.teamDir, "hook-logs");
 		await fs.promises.mkdir(logsDir, { recursive: true });
@@ -64,8 +64,8 @@ export async function persistHookLog(invocation: TeamsHookInvocation, res: Teams
 			JSON.stringify({ invocation, result: res }, null, 2) + "\n",
 			"utf8",
 		);
-	} catch {
-		// ignore logging errors
+	} catch (err: unknown) {
+		ctx?.ui.notify(`Hook log write failed: ${err instanceof Error ? err.message : String(err)}`, "warning");
 	}
 }
 
@@ -252,7 +252,7 @@ export async function processHookResult(opts: ProcessHookOpts): Promise<void> {
 	const { invocation, res, ctx, teamConfig, refreshTasks, renderWidget } = opts;
 
 	// Persist a log for debugging.
-	await persistHookLog(invocation, res);
+	await persistHookLog(invocation, res, ctx);
 
 	const ok = res.exitCode === 0 && !res.timedOut && !res.error;
 	const hookName = getHookBaseName(invocation.event);

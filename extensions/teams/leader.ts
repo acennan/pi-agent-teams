@@ -335,6 +335,7 @@ export function runLeader(pi: ExtensionAPI): void {
 		tracker,
 		transcriptTracker,
 		teammateEventUnsubs,
+		getCurrentCtx: () => currentCtx,
 		getCurrentTeamId: () => currentTeamId,
 		getTaskListId: () => taskListId,
 		getStyle: () => style,
@@ -389,8 +390,9 @@ export function runLeader(pi: ExtensionAPI): void {
 		}
 		stopLoops();
 
-		// Reset compaction state for the new session.
+		// Reset compaction and hook dedup state for the new session.
 		compactionInFlight = false;
+		seenHookEvents.clear();
 
 		await initSession(ctx);
 	});
@@ -414,6 +416,7 @@ export function runLeader(pi: ExtensionAPI): void {
 		pendingPlanApprovals,
 		getContextUsage: () => currentCtx?.getContextUsage(),
 		triggerCompaction: tryCompact,
+		getTeamConfig: () => teamConfig,
 	};
 	registerTeamsDelegateTool(toolOpts);
 	registerTeamsTaskTool(toolOpts);

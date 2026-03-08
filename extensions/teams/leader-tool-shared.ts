@@ -25,6 +25,8 @@ export interface TeamToolOpts {
 	pendingPlanApprovals: Map<string, { requestId: string; name: string; taskId?: string }>;
 	getContextUsage: () => ContextUsage | undefined;
 	triggerCompaction?: () => void;
+	/** Optional cached team config — avoids hitting disk on every tool call. */
+	getTeamConfig?: () => TeamConfig | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -46,7 +48,9 @@ export async function resolveTeamToolContext(opts: TeamToolOpts, ctx: ExtensionC
 	const teamDir = getTeamDir(teamId);
 	const taskListId = opts.getTaskListId();
 	const effectiveTlId = taskListId ?? teamId;
-	const cfg = await ensureTeamConfig(teamDir, {
+	// Use cached config when available to avoid hitting disk on every tool call.
+	const cached = opts.getTeamConfig?.();
+	const cfg = cached ?? await ensureTeamConfig(teamDir, {
 		teamId,
 		taskListId: effectiveTlId,
 		leadName: "team-lead",
