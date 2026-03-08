@@ -7,6 +7,7 @@ import { writeToMailbox } from "./mailbox.js";
 import { sanitizeName } from "./names.js";
 import { TEAM_MAILBOX_NS, taskAssignmentPayload } from "./protocol.js";
 import { createTask, listTasks, unassignTasksForAgent, updateTask, type TeamTask } from "./task-store.js";
+import { applyStatusChange, applyUnassign, applyReassign } from "./task-mutations.js";
 import { TeammateRpc } from "./teammate-rpc.js";
 import { ensureTeamConfig, loadTeamConfig, setMemberStatus, upsertMember, type TeamConfig } from "./team-config.js";
 import { getTeamDir } from "./paths.js";
@@ -143,6 +144,60 @@ export function runLeader(pi: ExtensionAPI): void {
 		if (inboxTimer) clearInterval(inboxTimer);
 		refreshTimer = null;
 		inboxTimer = null;
+	};
+
+	const startLoops = (ctx: ExtensionContext) => {
+		stopLoops();
+		refreshTimer = setInterval(async () => {
+			if (isStopping || refreshInFlight) return;
+			refreshInFlight = true;
+			try {
+				await heartbeatActiveAttachClaim(ctx);
+				await refreshTasks();
+				renderWidget();
+
+				// Proactively trigger compaction at 70% so team-aware custom
+				// instructions are used before pi's built-in threshold (~85%).
+				const usage = ctx.getContextUsage();
+				if (usage?.percent !== null && usage?.percent !== undefined && usage.percent > 70) {
+					tryCompact();
+				}
+			} finally {
+				refreshInFlight = false;
+			}
+		}, 1000);
+
+		inboxTimer = setInterval(async () => {
+			if (isStopping || inboxInFlight) return;
+			inboxInFlight = true;
+			try {
+				await pollLeaderInbox();
+			} finally {
+				inboxInFlight = false;
+			}
+		}, 700);
+	};
+
+	const initSession = async (ctx: ExtensionContext) => {
+		currentCtx = ctx;
+		currentTeamId = ctx.sessionManager.getSessionId();
+		// Keep the task list aligned with the active session. If you want a shared namespace,
+		// use `/team task use <taskListId>` after switching.
+		taskListId = currentTeamId;
+		lastAttachClaimHeartbeatMs = 0;
+
+		// Claude-style: a persisted team config file.
+		await ensureTeamConfig(getTeamDir(currentTeamId), {
+			teamId: currentTeamId,
+			taskListId: taskListId,
+			leadName: "team-lead",
+			style,
+		});
+
+		await refreshTasks();
+		renderWidget();
+
+		startLoops(ctx);
 	};
 
 	const releaseActiveAttachClaim = async (ctx: ExtensionContext): Promise<void> => {
@@ -649,55 +704,7 @@ export function runLeader(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
-		currentCtx = ctx;
-		currentTeamId = currentCtx.sessionManager.getSessionId();
-		// Keep the task list aligned with the active session. If you want a shared namespace,
-		// use `/team task use <taskListId>` after switching.
-		taskListId = currentTeamId;
-		lastAttachClaimHeartbeatMs = 0;
-
-		// Claude-style: a persisted team config file.
-		await ensureTeamConfig(getTeamDir(currentTeamId), {
-			teamId: currentTeamId,
-			taskListId: taskListId,
-			leadName: "team-lead",
-			style,
-		});
-
-		await refreshTasks();
-		renderWidget();
-
-		stopLoops();
-		refreshTimer = setInterval(async () => {
-			if (isStopping) return;
-			if (refreshInFlight) return;
-			refreshInFlight = true;
-			try {
-				await heartbeatActiveAttachClaim(ctx);
-				await refreshTasks();
-				renderWidget();
-
-				// Proactively trigger compaction at 70% so team-aware custom
-				// instructions are used before pi's built-in threshold (~85%).
-				const usage = ctx.getContextUsage();
-				if (usage?.percent !== null && usage?.percent !== undefined && usage.percent > 70) {
-					tryCompact();
-				}
-			} finally {
-				refreshInFlight = false;
-			}
-		}, 1000);
-
-		inboxTimer = setInterval(async () => {
-			if (isStopping) return;
-			if (inboxInFlight) return;
-			inboxInFlight = true;
-			try {
-				await pollLeaderInbox();
-			} finally {
-				inboxInFlight = false;
-			}
-		}, 700);
+		await initSession(ctx);
 	});
 
 	pi.on("session_compact", (_event, _ctx) => {
@@ -714,55 +721,10 @@ export function runLeader(pi: ExtensionAPI): void {
 		}
 		stopLoops();
 
-		currentCtx = ctx;
-		currentTeamId = currentCtx.sessionManager.getSessionId();
-		// Keep the task list aligned with the active session. If you want a shared namespace,
-		// use `/team task use <taskListId>` after switching.
-		taskListId = currentTeamId;
-		lastAttachClaimHeartbeatMs = 0;
-
-		await ensureTeamConfig(getTeamDir(currentTeamId), {
-			teamId: currentTeamId,
-			taskListId: taskListId,
-			leadName: "team-lead",
-			style,
-		});
-
-		await refreshTasks();
-		renderWidget();
-
-		// Restart background refresh/poll loops for the new session.
+		// Reset compaction state for the new session.
 		compactionInFlight = false;
-		refreshTimer = setInterval(async () => {
-			if (isStopping) return;
-			if (refreshInFlight) return;
-			refreshInFlight = true;
-			try {
-				await heartbeatActiveAttachClaim(ctx);
-				await refreshTasks();
-				renderWidget();
 
-				// Proactively trigger compaction at 70% so team-aware custom
-				// instructions are used before pi's built-in threshold (~85%).
-				const usage = ctx.getContextUsage();
-				if (usage?.percent !== null && usage?.percent !== undefined && usage.percent > 70) {
-					tryCompact();
-				}
-			} finally {
-				refreshInFlight = false;
-			}
-		}, 1000);
-
-		inboxTimer = setInterval(async () => {
-			if (isStopping) return;
-			if (inboxInFlight) return;
-			inboxInFlight = true;
-			try {
-				await pollLeaderInbox();
-			} finally {
-				inboxInFlight = false;
-			}
-		}, 700);
+		await initSession(ctx);
 	});
 
 	pi.on("session_shutdown", async () => {
@@ -859,27 +821,14 @@ export function runLeader(pi: ExtensionAPI): void {
 				void refreshTasks();
 			},
 			async setTaskStatus(taskId: string, status: TeamTask["status"]) {
-				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-					if (cur.status === status) return cur;
-					const metadata = { ...(cur.metadata ?? {}) };
-					if (status === "completed") metadata.completedAt = new Date().toISOString();
-					if (status !== "completed" && cur.status === "completed") metadata.reopenedAt = new Date().toISOString();
-					return { ...cur, status, metadata };
-				});
+				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyStatusChange(cur, status));
 				if (!updated) return false;
 				await refreshTasks();
 				renderWidget();
 				return true;
 			},
 			async unassignTask(taskId: string) {
-				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-					if (!cur.owner) return cur;
-					if (cur.status === "completed") return { ...cur, owner: undefined };
-					const metadata = { ...(cur.metadata ?? {}) };
-					metadata.unassignedAt = new Date().toISOString();
-					metadata.unassignedReason = "leader-panel";
-					return { ...cur, owner: undefined, status: "pending", metadata };
-				});
+				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyUnassign(cur, leadName, "leader-panel"));
 				if (!updated) return false;
 				await refreshTasks();
 				renderWidget();
@@ -888,14 +837,7 @@ export function runLeader(pi: ExtensionAPI): void {
 			async assignTask(taskId: string, ownerName: string) {
 				const owner = sanitizeName(ownerName);
 				if (!owner) return false;
-				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-					const metadata = { ...(cur.metadata ?? {}) };
-					metadata.reassignedAt = new Date().toISOString();
-					metadata.reassignedBy = leadName;
-					metadata.reassignedTo = owner;
-					if (cur.status === "completed") return { ...cur, owner, metadata };
-					return { ...cur, owner, status: "pending", metadata };
-				});
+				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyReassign(cur, owner, leadName));
 				if (!updated) return false;
 
 				await writeToMailbox(teamDir, effectiveTlId, owner, {

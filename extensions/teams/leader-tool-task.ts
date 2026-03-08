@@ -12,6 +12,7 @@ import {
 	removeTaskDependency,
 	updateTask,
 } from "./task-store.js";
+import { applyStatusChange, applyUnassign, applyReassign } from "./task-mutations.js";
 import { writeToMailbox } from "./mailbox.js";
 import { taskAssignmentPayload } from "./protocol.js";
 import {
@@ -65,13 +66,7 @@ export async function executeTaskAction(
 			};
 		}
 
-		const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-			if (cur.status === status) return cur;
-			const metadata = { ...(cur.metadata ?? {}) };
-			if (status === "completed") metadata.completedAt = new Date().toISOString();
-			if (status !== "completed" && cur.status === "completed") metadata.reopenedAt = new Date().toISOString();
-			return { ...cur, status, metadata };
-		});
+		const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyStatusChange(cur, status));
 		if (!updated) {
 			return {
 				content: [{ type: "text", text: `Task not found: ${taskId}` }],
@@ -95,15 +90,7 @@ export async function executeTaskAction(
 			};
 		}
 
-		const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-			if (!cur.owner) return cur;
-			if (cur.status === "completed") return { ...cur, owner: undefined };
-			const metadata = { ...(cur.metadata ?? {}) };
-			metadata.unassignedAt = new Date().toISOString();
-			metadata.unassignedBy = cfg.leadName;
-			metadata.unassignedReason = "teams-tool";
-			return { ...cur, owner: undefined, status: "pending", metadata };
-		});
+		const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyUnassign(cur, cfg.leadName, "teams-tool"));
 		if (!updated) {
 			return {
 				content: [{ type: "text", text: `Task not found: ${taskId}` }],
@@ -128,14 +115,7 @@ export async function executeTaskAction(
 			};
 		}
 
-		const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => {
-			const metadata = { ...(cur.metadata ?? {}) };
-			metadata.reassignedAt = new Date().toISOString();
-			metadata.reassignedBy = cfg.leadName;
-			metadata.reassignedTo = assignee;
-			if (cur.status === "completed") return { ...cur, owner: assignee, metadata };
-			return { ...cur, owner: assignee, status: "pending", metadata };
-		});
+		const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyReassign(cur, assignee, cfg.leadName));
 		if (!updated) {
 			return {
 				content: [{ type: "text", text: `Task not found: ${taskId}` }],
