@@ -3,33 +3,19 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { SessionManager } from "@mariozechner/pi-coding-agent";
-import { writeToMailbox } from "./mailbox.js";
-import { sanitizeName } from "./names.js";
-import { TEAM_MAILBOX_NS, taskAssignmentPayload } from "./protocol.js";
-import { createTask, listTasks, unassignTasksForAgent, updateTask, type TeamTask } from "./task-store.js";
-import { applyStatusChange, applyUnassign, applyReassign } from "./task-mutations.js";
+import { listTasks, unassignTasksForAgent, type TeamTask } from "./task-store.js";
 import { TeammateRpc } from "./teammate-rpc.js";
 import { ensureTeamConfig, loadTeamConfig, setMemberStatus, upsertMember, type TeamConfig } from "./team-config.js";
 import { getTeamDir } from "./paths.js";
 import { heartbeatTeamAttachClaim, releaseTeamAttachClaim } from "./team-attach-claim.js";
-import { ensureWorktreeCwd } from "./worktree.js";
 import { ActivityTracker, TranscriptTracker } from "./activity-tracker.js";
 import { openInteractiveWidget } from "./teams-panel.js";
+import { buildWidgetCallbacks } from "./leader-widget-callbacks.js";
 import { createTeamsWidget } from "./teams-widget.js";
-import { resolveTeammateModelSelection, formatProviderModel } from "./model-policy.js";
-import { getTeamsStyleFromEnv, type TeamsStyle, formatMemberDisplayName, getTeamsStrings } from "./teams-style.js";
+import { getTeamsStyleFromEnv, type TeamsStyle, getTeamsStrings } from "./teams-style.js";
 import { pollLeaderInbox as pollLeaderInboxImpl } from "./leader-inbox.js";
-import {
-	getHookBaseName,
-	getTeamsHookFailureAction,
-	getTeamsHookFollowupOwnerPolicy,
-	getTeamsHookMaxReopensPerTask,
-	resolveTeamsHookFollowupOwner,
-	runTeamsHook,
-	shouldCreateHookFollowupTask,
-	shouldReopenTaskOnHookFailure,
-	type TeamsHookInvocation,
-} from "./hooks.js";
+import { runTeamsHook, type TeamsHookInvocation } from "./hooks.js";
+import { processHookResult } from "./leader-hooks.js";
 import { handleTeamCommand } from "./leader-team-command.js";
 import { registerTeamsTool } from "./leader-teams-tool.js";
 import { registerTeamsDelegateTool } from "./leader-tool-delegate.js";
@@ -39,7 +25,8 @@ import { registerTeamsMemberTool } from "./leader-tool-member.js";
 import { registerTeamsPolicyTool } from "./leader-tool-policy.js";
 import { buildTeamCompactionInstructions } from "./leader-compaction.js";
 import { buildTeamStateSnapshot, filterStaleTeamsResults } from "./leader-context-filter.js";
-import type { ContextMode, SpawnTeammateFn, SpawnTeammateResult, WorkspaceMode } from "./spawn-types.js";
+import type { ContextMode, SpawnTeammateFn } from "./spawn-types.js";
+import { spawnTeammateImpl, type SpawnContext } from "./leader-spawn.js";
 
 function getTeamsExtensionEntryPath(): string | null {
 	// In dev, teammates won't automatically have this extension unless it is installed or discoverable.
@@ -275,189 +262,14 @@ export function runLeader(pi: ExtensionAPI): void {
 				const res = await runTeamsHook({ invocation, cwd: currentCtx.cwd });
 				if (!res.ran) return;
 
-				// Persist a log for debugging.
-				try {
-					const logsDir = path.join(invocation.teamDir, "hook-logs");
-					await fs.promises.mkdir(logsDir, { recursive: true });
-					const name = `${new Date().toISOString().replace(/[:.]/g, "-")}_${invocation.event}.json`;
-					await fs.promises.writeFile(
-						path.join(logsDir, name),
-						JSON.stringify(
-							{
-								invocation,
-								result: res,
-							},
-							null,
-							2,
-						) + "\n",
-						"utf8",
-					);
-				} catch {
-					// ignore logging errors
-				}
-
-				const ok = res.exitCode === 0 && !res.timedOut && !res.error;
-				const hookName = getHookBaseName(invocation.event);
-				const cfgForInvocation = await loadTeamConfig(invocation.teamDir);
-				const hookPolicy = cfgForInvocation?.hooks;
-				const failureAction = getTeamsHookFailureAction(process.env, hookPolicy?.failureAction);
-				const shouldFollowup = shouldCreateHookFollowupTask(failureAction);
-				const shouldReopen = shouldReopenTaskOnHookFailure(failureAction);
-				const maxReopens = getTeamsHookMaxReopensPerTask(process.env, hookPolicy?.maxReopensPerTask);
-				const followupOwnerPolicy = getTeamsHookFollowupOwnerPolicy(process.env, hookPolicy?.followupOwner);
-				const task = invocation.completedTask;
-				const leadName = cfgForInvocation?.leadName ?? teamConfig?.leadName ?? "team-lead";
-
-				const stderrFirstLine = res.stderr
-					.split(/\r?\n/)
-					.map((line) => line.trim())
-					.find((line) => line.length > 0);
-				const failureParts: string[] = [];
-				if (res.error) failureParts.push(res.error);
-				if (res.timedOut) failureParts.push(`timeout after ${res.durationMs}ms`);
-				if (!res.timedOut && res.exitCode !== null && res.exitCode !== 0) failureParts.push(`exit code ${res.exitCode}`);
-				if (stderrFirstLine) failureParts.push(stderrFirstLine.length > 180 ? `${stderrFirstLine.slice(0, 179)}…` : stderrFirstLine);
-				const failureSummary = failureParts.join(" • ") || "hook failed";
-
-				// Idle hooks are intentionally quiet unless they fail.
-				if (invocation.event === "idle") {
-					if (!ok) {
-						currentCtx.ui.notify(`Hook ${hookName} failed: ${failureSummary}`, "warning");
-					}
-					return;
-				}
-
-				let taskReopened = false;
-				let taskReopenSuppressed = false;
-				if (task?.id) {
-					const nowIso = new Date().toISOString();
-					await updateTask(invocation.teamDir, invocation.taskListId, task.id, (cur) => {
-						const metadata = { ...(cur.metadata ?? {}) };
-						const prevFailureCountRaw = metadata["qualityGateFailureCount"];
-						const prevFailureCount =
-							typeof prevFailureCountRaw === "number" && Number.isFinite(prevFailureCountRaw) ? prevFailureCountRaw : 0;
-
-						metadata["qualityGateHook"] = hookName;
-						metadata["qualityGateAt"] = nowIso;
-
-						if (ok) {
-							metadata["qualityGateStatus"] = "passed";
-							metadata["qualityGateSummary"] = `passed in ${res.durationMs}ms`;
-							metadata["qualityGateLastSuccessAt"] = nowIso;
-							metadata["qualityGateReopenSuppressed"] = false;
-							return { ...cur, metadata };
-						}
-
-						metadata["qualityGateStatus"] = "failed";
-						metadata["qualityGateSummary"] = failureSummary;
-						metadata["qualityGateFailureCount"] = prevFailureCount + 1;
-						metadata["qualityGateLastFailureAt"] = nowIso;
-
-						if (shouldReopen && cur.status === "completed") {
-							const prevReopenCountRaw = metadata["reopenedByQualityGateCount"];
-							const prevReopenCount =
-								typeof prevReopenCountRaw === "number" && Number.isFinite(prevReopenCountRaw) ? prevReopenCountRaw : 0;
-							const canAutoReopen = maxReopens > 0 && prevReopenCount < maxReopens;
-							if (canAutoReopen) {
-								taskReopened = true;
-								metadata["reopenedByQualityGateAt"] = nowIso;
-								metadata["reopenedByQualityGateHook"] = hookName;
-								metadata["reopenedByQualityGateCount"] = prevReopenCount + 1;
-								metadata["qualityGateReopenSuppressed"] = false;
-								return { ...cur, status: "pending", metadata };
-							}
-							taskReopenSuppressed = true;
-							metadata["qualityGateReopenSuppressed"] = true;
-							metadata["qualityGateReopenSuppressedReason"] =
-								maxReopens <= 0
-									? "PI_TEAMS_HOOKS_MAX_REOPENS_PER_TASK=0"
-									: `reopen limit reached (${maxReopens})`;
-						}
-						return { ...cur, metadata };
-					});
-
-					await refreshTasks();
-					renderWidget();
-				}
-
-				if (ok) {
-					const taskRef = task?.id ? ` for task #${task.id}` : "";
-					currentCtx.ui.notify(`Hook ${hookName} passed${taskRef} (${res.durationMs}ms)`, "info");
-					return;
-				}
-
-				const failedTaskRef = task?.id ? ` for task #${task.id}` : "";
-				currentCtx.ui.notify(`Hook ${hookName} failed${failedTaskRef}: ${failureSummary}`, "warning");
-				if (taskReopened && task?.id) {
-					currentCtx.ui.notify(`Reopened task #${task.id} due to quality-gate failure`, "warning");
-				} else if (taskReopenSuppressed && shouldReopen && task?.id) {
-					currentCtx.ui.notify(`Auto-reopen suppressed for task #${task.id} (limit ${maxReopens})`, "warning");
-				}
-
-				let followupTask: TeamTask | null = null;
-				if (shouldFollowup && task?.id) {
-					const followupOwner = resolveTeamsHookFollowupOwner({
-						policy: followupOwnerPolicy,
-						memberName: invocation.memberName,
-						leadName,
-					});
-					const subject = `Quality gate failed: ${hookName} (task #${task.id})`;
-					const descParts: string[] = [];
-					descParts.push(`Hook: ${hookName}`);
-					descParts.push(`Policy: ${failureAction}`);
-					descParts.push(`Failure: ${failureSummary}`);
-					if (res.command?.length) descParts.push(`Command: ${res.command.join(" ")}`);
-					descParts.push("");
-					if (task.subject) descParts.push(`Original task subject: ${task.subject}`);
-					descParts.push("");
-					if (res.stdout.trim()) {
-						descParts.push("STDOUT:");
-						descParts.push(res.stdout.trim());
-						descParts.push("");
-					}
-					if (res.stderr.trim()) {
-						descParts.push("STDERR:");
-						descParts.push(res.stderr.trim());
-						descParts.push("");
-					}
-
-					followupTask = await createTask(invocation.teamDir, invocation.taskListId, {
-						subject,
-						description: descParts.join("\n"),
-						owner: followupOwner,
-					});
-
-					if (followupOwner) {
-						await writeToMailbox(invocation.teamDir, invocation.taskListId, followupOwner, {
-							from: leadName,
-							text: JSON.stringify(taskAssignmentPayload(followupTask, leadName)),
-							timestamp: new Date().toISOString(),
-						});
-					}
-
-					await refreshTasks();
-					renderWidget();
-				}
-
-				const remediationTarget = sanitizeName(task?.owner ?? invocation.memberName ?? "");
-				if (remediationTarget) {
-					const nextSteps: string[] = [];
-					if (task?.id && taskReopened) nextSteps.push(`Task #${task.id} was reopened to pending.`);
-					if (followupTask?.id) nextSteps.push(`Follow-up task #${followupTask.id} was created.`);
-					if (nextSteps.length === 0 && task?.id) nextSteps.push(`Task #${task.id} still requires remediation.`);
-
-					const messageLines = [
-						`Quality gate failed (${hookName}${task?.id ? ` / task #${task.id}` : ""}): ${failureSummary}`,
-						...nextSteps,
-						"Please remediate automatically and continue without waiting for user intervention.",
-					];
-
-					await writeToMailbox(invocation.teamDir, invocation.taskListId, remediationTarget, {
-						from: leadName,
-						text: messageLines.join("\n"),
-						timestamp: new Date().toISOString(),
-					});
-				}
+				await processHookResult({
+					invocation,
+					res,
+					ctx: currentCtx,
+					teamConfig,
+					refreshTasks,
+					renderWidget,
+				});
 			})
 			.catch((err: unknown) => {
 				if (!currentCtx) return;
@@ -517,167 +329,23 @@ export function runLeader(pi: ExtensionAPI): void {
 		});
 	};
 
-	const spawnTeammate: SpawnTeammateFn = async (ctx, opts): Promise<SpawnTeammateResult> => {
-		const warnings: string[] = [];
-		const mode: ContextMode = opts.mode ?? "fresh";
-		let workspaceMode: WorkspaceMode = opts.workspaceMode ?? "shared";
-
-		const name = sanitizeName(opts.name);
-		if (!name) return { ok: false, error: "Missing comrade name" };
-		if (teammates.has(name)) {
-			const strings = getTeamsStrings(style);
-			return { ok: false, error: `${formatMemberDisplayName(style, name)} already exists (${strings.teamNoun})` };
-		}
-
-		// Spawn-time model / thinking overrides (optional).
-		const thinkingLevel = opts.thinking ?? pi.getThinkingLevel();
-
-		const modelResolution = resolveTeammateModelSelection({
-			modelOverride: opts.model,
-			leaderProvider: ctx.model?.provider,
-			leaderModelId: ctx.model?.id,
-		});
-		if (!modelResolution.ok) return { ok: false, error: modelResolution.error };
-		const { provider: childProvider, modelId: childModelId, warnings: modelWarnings } = modelResolution.value;
-		warnings.push(...modelWarnings);
-
-		const teamId = currentTeamId ?? ctx.sessionManager.getSessionId();
-		const teamDir = getTeamDir(teamId);
-		const teamSessionsDir = getTeamSessionsDir(teamDir);
-		const session = await createSessionForTeammate(ctx, mode, teamSessionsDir);
-		const { sessionFile, note } = session;
-		warnings.push(...session.warnings);
-
-		const t = new TeammateRpc(name, sessionFile);
-		teammates.set(name, t);
-		// Track teammate activity for the widget/panel.
-		const unsub = t.onEvent((ev) => {
-			tracker.handleEvent(name, ev);
-			transcriptTracker.handleEvent(name, ev);
-		});
-		teammateEventUnsubs.set(name, unsub);
-		renderWidget();
-
-		// On crash/close, unassign tasks like Claude.
-		const leaderTeamId = teamId;
-		t.onClose((code) => {
-			try {
-				teammateEventUnsubs.get(name)?.();
-			} catch {
-				// ignore
-			}
-			teammateEventUnsubs.delete(name);
-			tracker.reset(name);
-			transcriptTracker.reset(name);
-
-			if (currentTeamId !== leaderTeamId) return;
-			const effectiveTlId = taskListId ?? leaderTeamId;
-			void unassignTasksForAgent(
-				teamDir,
-				effectiveTlId,
-				name,
-				`${formatMemberDisplayName(style, name)} ${getTeamsStrings(style).leftVerb}`,
-			).finally(() => {
-				void refreshTasks().finally(renderWidget);
-			});
-			void setMemberStatus(teamDir, name, "offline", { meta: { exitCode: code ?? undefined } });
-		});
-
-		const builtInToolSet = new Set(["read", "bash", "edit", "write", "grep", "find", "ls"]);
-		const tools = (pi.getActiveTools() ?? []).filter((t) => builtInToolSet.has(t));
-		const argsForChild: string[] = [];
-		if (sessionFile) argsForChild.push("--session", sessionFile);
-		argsForChild.push("--session-dir", teamSessionsDir);
-		if (tools.length) argsForChild.push("--tools", tools.join(","));
-
-		// Model + thinking for the child process.
-		if (childModelId) {
-			if (childProvider) argsForChild.push("--provider", childProvider);
-			argsForChild.push("--model", childModelId);
-		}
-		argsForChild.push("--thinking", thinkingLevel);
-
-		const teamsEntry = getTeamsExtensionEntryPath();
-		if (teamsEntry) {
-			argsForChild.push("--no-extensions", "-e", teamsEntry);
-		}
-
-		const strings = getTeamsStrings(style);
-		const systemAppend = `You are ${strings.memberTitle.toLowerCase()} '${name}'. You collaborate with the ${strings.leaderTitle.toLowerCase()}. Prefer working from the shared task list.\n`;
-		argsForChild.push("--append-system-prompt", systemAppend);
-
-		const autoClaim = (process.env.PI_TEAMS_DEFAULT_AUTO_CLAIM ?? "1") === "1";
-
-		let childCwd = ctx.cwd;
-		if (workspaceMode === "worktree") {
-			const res = await ensureWorktreeCwd({ leaderCwd: ctx.cwd, teamDir, teamId, agentName: name });
-			childCwd = res.cwd;
-			workspaceMode = res.mode;
-			warnings.push(...res.warnings);
-		}
-
-		try {
-			await t.start({
-				cwd: childCwd,
-				env: {
-					PI_TEAMS_WORKER: "1",
-					PI_TEAMS_TEAM_ID: teamId,
-					PI_TEAMS_TASK_LIST_ID: taskListId ?? teamId,
-					PI_TEAMS_AGENT_NAME: name,
-					PI_TEAMS_LEAD_NAME: "team-lead",
-					PI_TEAMS_STYLE: style,
-					PI_TEAMS_AUTO_CLAIM: autoClaim ? "1" : "0",
-					...(opts.planRequired ? { PI_TEAMS_PLAN_REQUIRED: "1" } : {}),
-				},
-				args: argsForChild,
-			});
-		} catch (err) {
-			teammates.delete(name);
-			return { ok: false, error: err instanceof Error ? err.message : String(err) };
-		}
-
-		const sessionName = `pi agent teams - ${strings.memberTitle.toLowerCase()} ${name}`;
-
-		// Leader-driven session naming (so teammates are easy to spot in /resume).
-		try {
-			await t.setSessionName(sessionName);
-		} catch (err) {
-			warnings.push(`Failed to set session name for ${name}: ${err instanceof Error ? err.message : String(err)}`);
-		}
-
-		// Also send via mailbox so non-RPC/manual workers can be named the same way.
-		try {
-			const ts = new Date().toISOString();
-			await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-				from: "team-lead",
-				text: JSON.stringify({ type: "set_session_name", name: sessionName, from: "team-lead", timestamp: ts }),
-				timestamp: ts,
-			});
-		} catch {
-			// ignore
-		}
-
-		await ensureTeamConfig(teamDir, { teamId, taskListId: taskListId ?? teamId, leadName: "team-lead", style });
-		const childModel = formatProviderModel(childProvider, childModelId);
-		await upsertMember(teamDir, {
-			name,
-			role: "worker",
-			status: "online",
-			cwd: childCwd,
-			sessionFile,
-			meta: {
-				workspaceMode,
-				sessionName,
-				thinkingLevel,
-				...(childModel ? { model: childModel } : {}),
-			},
-		});
-
-		await refreshTasks();
-		renderWidget();
-
-		return { ok: true, name, mode, workspaceMode, childCwd, note, warnings };
+	const spawnCtx: SpawnContext = {
+		pi,
+		teammates,
+		tracker,
+		transcriptTracker,
+		teammateEventUnsubs,
+		getCurrentTeamId: () => currentTeamId,
+		getTaskListId: () => taskListId,
+		getStyle: () => style,
+		refreshTasks,
+		renderWidget,
+		getTeamsExtensionEntryPath,
+		createSessionForTeammate,
+		getTeamSessionsDir,
 	};
+
+	const spawnTeammate: SpawnTeammateFn = (ctx, opts) => spawnTeammateImpl(spawnCtx, ctx, opts);
 
 	const pollLeaderInbox = async () => {
 		if (!currentCtx || !currentTeamId) return;
@@ -776,95 +444,23 @@ export function runLeader(pi: ExtensionAPI): void {
 	});
 
 	const openWidget = async (ctx: ExtensionCommandContext) => {
-		const teamId = currentTeamId ?? ctx.sessionManager.getSessionId();
-		const teamDir = getTeamDir(teamId);
-		const effectiveTlId = taskListId ?? teamId;
-		const leadName = teamConfig?.leadName ?? "team-lead";
-		const strings = getTeamsStrings(style);
-
-		await openInteractiveWidget(ctx, {
-			getTeammates: () => teammates,
-			getTracker: () => tracker,
-			getTranscript: (n: string) => transcriptTracker.get(n),
+		const deps = buildWidgetCallbacks({
+			teammates,
+			tracker,
+			transcriptTracker,
 			getTasks: () => tasks,
 			getTeamConfig: () => teamConfig,
 			getStyle: () => style,
 			isDelegateMode: () => delegateMode,
-			async sendMessage(name: string, message: string) {
-				const rpc = teammates.get(name);
-				if (rpc) {
-					if (rpc.status === "streaming") await rpc.followUp(message);
-					else await rpc.prompt(message);
-					return;
-				}
-
-				await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
-					from: leadName,
-					text: message,
-					timestamp: new Date().toISOString(),
-				});
-			},
-			abortMember(name: string) {
-				const rpc = teammates.get(name);
-				if (rpc) void rpc.abort();
-			},
-			killMember(name: string) {
-				const rpc = teammates.get(name);
-				if (!rpc) return;
-
-				void rpc.stop();
-				teammates.delete(name);
-
-				const displayName = formatMemberDisplayName(style, name);
-				void unassignTasksForAgent(teamDir, effectiveTlId, name, `${displayName} ${strings.killedVerb}`);
-				void setMemberStatus(teamDir, name, "offline", { meta: { killedAt: new Date().toISOString() } });
-				void refreshTasks();
-			},
-			async setTaskStatus(taskId: string, status: TeamTask["status"]) {
-				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyStatusChange(cur, status));
-				if (!updated) return false;
-				await refreshTasks();
-				renderWidget();
-				return true;
-			},
-			async unassignTask(taskId: string) {
-				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyUnassign(cur, leadName, "leader-panel"));
-				if (!updated) return false;
-				await refreshTasks();
-				renderWidget();
-				return true;
-			},
-			async assignTask(taskId: string, ownerName: string) {
-				const owner = sanitizeName(ownerName);
-				if (!owner) return false;
-				const updated = await updateTask(teamDir, effectiveTlId, taskId, (cur) => applyReassign(cur, owner, leadName));
-				if (!updated) return false;
-
-				await writeToMailbox(teamDir, effectiveTlId, owner, {
-					from: leadName,
-					text: JSON.stringify(taskAssignmentPayload(updated, leadName)),
-					timestamp: new Date().toISOString(),
-				});
-
-				await refreshTasks();
-				renderWidget();
-				return true;
-			},
-			getActiveTeamId() {
-				return currentTeamId;
-			},
-			getSessionTeamId() {
-				return ctx.sessionManager.getSessionId();
-			},
-			suppressWidget() {
-				widgetSuppressed = true;
-				ctx.ui.setWidget("pi-teams", undefined);
-			},
-			restoreWidget() {
-				widgetSuppressed = false;
-				renderWidget();
-			},
+			getCurrentTeamId: () => currentTeamId,
+			getTaskListId: () => taskListId,
+			getWidgetSuppressed: () => widgetSuppressed,
+			setWidgetSuppressed: (v: boolean) => { widgetSuppressed = v; },
+			refreshTasks,
+			renderWidget,
+			ctx,
 		});
+		await openInteractiveWidget(ctx, deps);
 	};
 
 	pi.registerCommand("tw", {
