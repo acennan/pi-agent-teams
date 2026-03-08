@@ -109,6 +109,18 @@ async function createSessionForTeammate(
 }
 
 // Message parsers are shared with the worker implementation.
+// ---------------------------------------------------------------------------
+// Named constants (previously inline magic numbers)
+// ---------------------------------------------------------------------------
+/** Context-usage percentage at which team-aware compaction is triggered. */
+const COMPACTION_TRIGGER_PERCENT = 70;
+/** Interval (ms) for the refresh/heartbeat timer loop. */
+const REFRESH_INTERVAL_MS = 1000;
+/** Interval (ms) for the leader inbox polling loop. */
+const INBOX_POLL_INTERVAL_MS = 700;
+/** Minimum interval (ms) between attach-claim heartbeats. */
+const ATTACH_CLAIM_HEARTBEAT_INTERVAL_MS = 5_000;
+
 export function runLeader(pi: ExtensionAPI): void {
 	const teammates = new Map<string, TeammateRpc>();
 	const tracker = new ActivityTracker();
@@ -151,16 +163,16 @@ export function runLeader(pi: ExtensionAPI): void {
 				await refreshTasks();
 				renderWidget();
 
-				// Proactively trigger compaction at 70% so team-aware custom
+				// Proactively trigger compaction at COMPACTION_TRIGGER_PERCENT so team-aware custom
 				// instructions are used before pi's built-in threshold (~85%).
 				const usage = ctx.getContextUsage();
-				if (usage?.percent !== null && usage?.percent !== undefined && usage.percent > 70) {
+				if (usage?.percent !== null && usage?.percent !== undefined && usage.percent > COMPACTION_TRIGGER_PERCENT) {
 					tryCompact();
 				}
 			} finally {
 				refreshInFlight = false;
 			}
-		}, 1000);
+		}, REFRESH_INTERVAL_MS);
 
 		inboxTimer = setInterval(async () => {
 			if (isStopping || inboxInFlight) return;
@@ -170,7 +182,7 @@ export function runLeader(pi: ExtensionAPI): void {
 			} finally {
 				inboxInFlight = false;
 			}
-		}, 700);
+		}, INBOX_POLL_INTERVAL_MS);
 	};
 
 	const initSession = async (ctx: ExtensionContext) => {
@@ -207,7 +219,7 @@ export function runLeader(pi: ExtensionAPI): void {
 		const sessionTeamId = ctx.sessionManager.getSessionId();
 		if (currentTeamId === sessionTeamId) return;
 		const nowMs = Date.now();
-		if (nowMs - lastAttachClaimHeartbeatMs < 5_000) return;
+		if (nowMs - lastAttachClaimHeartbeatMs < ATTACH_CLAIM_HEARTBEAT_INTERVAL_MS) return;
 		lastAttachClaimHeartbeatMs = nowMs;
 		const result = await heartbeatTeamAttachClaim(getTeamDir(currentTeamId), sessionTeamId);
 		if (result === "updated") return;

@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { cleanupTeamDir } from "./cleanup.js";
+import { fireAndForget } from "./fire-and-forget.js";
 import { writeToMailbox } from "./mailbox.js";
 import { sanitizeName } from "./names.js";
 import { getTeamDir, getTeamsRootDir, getTeamsStylesDir } from "./paths.js";
@@ -280,13 +281,13 @@ export async function handleTeamShutdownCommand(opts: {
 		});
 
 		// Best-effort: record in member metadata (if present).
-		void setMemberStatus(teamDir, name, "online", {
+		fireAndForget(setMemberStatus(teamDir, name, "online", {
 			meta: {
 				shutdownRequestedAt: ts,
 				shutdownRequestId: requestId,
 				...(reason ? { shutdownReason: reason } : {}),
 			},
-		});
+		}), ctx);
 
 		ctx.ui.notify(`${formatMemberDisplayName(style, name)} ${strings.shutdownRequestedVerb}`, "info");
 
@@ -296,7 +297,7 @@ export async function handleTeamShutdownCommand(opts: {
 			setTimeout(() => {
 				if (getActiveTeamId() !== teamId) return;
 				if (t.status === "stopped" || t.status === "error") return;
-				void (async () => {
+				fireAndForget((async () => {
 					try {
 						await t.stop();
 						await setMemberStatus(teamDir, name, "offline", {
@@ -309,7 +310,7 @@ export async function handleTeamShutdownCommand(opts: {
 					} catch {
 						// ignore
 					}
-				})();
+				})(), getCurrentCtx());
 			}, 10_000);
 		}
 
@@ -382,9 +383,9 @@ export async function handleTeamShutdownCommand(opts: {
 			// ignore mailbox errors
 		}
 
-		void setMemberStatus(teamDir, m.name, "offline", {
+		fireAndForget(setMemberStatus(teamDir, m.name, "offline", {
 			meta: { shutdownRequestedAt: ts, shutdownRequestId: requestId, stoppedReason: reason },
-		});
+		}), ctx);
 	}
 
 	renderWidget();

@@ -63,16 +63,10 @@ export async function executeMemberAction(
 		const nameRaw = params.name?.trim();
 		const name = sanitizeName(nameRaw ?? "");
 		if (!name) {
-			return {
-				content: [{ type: "text", text: "spawn requires name" }],
-				details: { action, name: nameRaw },
-			};
+			return compactResult("spawn requires name", { action, name: nameRaw });
 		}
 		if (teammates.has(name)) {
-			return {
-				content: [{ type: "text", text: `${formatMemberDisplayName(style, name)} is already running` }],
-				details: { action, teamId, name, alreadyRunning: true },
-			};
+			return compactResult(`${formatMemberDisplayName(style, name)} is already running`, { action, teamId, name, alreadyRunning: true });
 		}
 
 		const contextMode: ContextMode = params.contextMode === "branch" ? "branch" : "fresh";
@@ -89,10 +83,7 @@ export async function executeMemberAction(
 		});
 
 		if (!res.ok) {
-			return {
-				content: [{ type: "text", text: `Failed to spawn ${formatMemberDisplayName(style, name)}: ${res.error}` }],
-				details: { action, teamId, name, error: res.error },
-			};
+			return compactResult(`Failed to spawn ${formatMemberDisplayName(style, name)}: ${res.error}`, { action, teamId, name, error: res.error });
 		}
 
 		await refreshUi();
@@ -101,27 +92,18 @@ export async function executeMemberAction(
 		];
 		if (res.note) lines.push(`note: ${res.note}`);
 		for (const w of res.warnings) lines.push(`warning: ${w}`);
-		return {
-			content: [{ type: "text", text: lines.join("\n") }],
-			details: { action, teamId, name: res.name, mode: res.mode, workspaceMode: res.workspaceMode, warnings: res.warnings },
-		};
+		return compactResult(lines.join("\n"), { action, teamId, name: res.name, mode: res.mode, workspaceMode: res.workspaceMode, warnings: res.warnings });
 	}
 
 	if (action === "kill") {
 		const nameRaw = params.name?.trim();
 		const name = sanitizeName(nameRaw ?? "");
 		if (!name) {
-			return {
-				content: [{ type: "text", text: "kill requires name" }],
-				details: { action, name: nameRaw },
-			};
+			return compactResult("kill requires name", { action, name: nameRaw });
 		}
 		const rpc = teammates.get(name);
 		if (!rpc) {
-			return {
-				content: [{ type: "text", text: `Unknown ${strings.memberTitle.toLowerCase()}: ${name}` }],
-				details: { action, name },
-			};
+			return compactResult(`Unknown ${strings.memberTitle.toLowerCase()}: ${name}`, { action, name });
 		}
 
 		await rpc.stop();
@@ -129,10 +111,7 @@ export async function executeMemberAction(
 		await unassignTasksForAgent(teamDir, effectiveTlId, name, `${formatMemberDisplayName(style, name)} ${strings.killedVerb}`);
 		await setMemberStatus(teamDir, name, "offline", { meta: { killedAt: new Date().toISOString() } });
 		await refreshUi();
-		return {
-			content: [{ type: "text", text: `${formatMemberDisplayName(style, name)} ${strings.killedVerb} (SIGTERM)` }],
-			details: { action, teamId, name },
-		};
+		return compactResult(`${formatMemberDisplayName(style, name)} ${strings.killedVerb} (SIGTERM)`, { action, teamId, name });
 	}
 
 	if (action === "shutdown") {
@@ -140,10 +119,7 @@ export async function executeMemberAction(
 		const all = params.all === true;
 		const explicitName = sanitizeName(params.name?.trim() ?? "");
 		if (!all && !explicitName) {
-			return {
-				content: [{ type: "text", text: "shutdown requires name (or all=true)" }],
-				details: { action },
-			};
+			return compactResult("shutdown requires name (or all=true)", { action });
 		}
 
 		const recipients = new Set<string>();
@@ -234,10 +210,7 @@ export async function executeMemberAction(
 		);
 	}
 
-	return {
-		content: [{ type: "text", text: `Unsupported member action: ${String(action)}` }],
-		details: { action },
-	};
+	return compactResult(`Unsupported member action: ${String(action)}`, { action });
 }
 
 // ---------------------------------------------------------------------------

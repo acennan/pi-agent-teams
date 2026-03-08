@@ -49,10 +49,7 @@ export async function executeMessageAction(
 		const nameRaw = params.name?.trim();
 		const message = params.message?.trim();
 		if (!nameRaw || !message) {
-			return {
-				content: [{ type: "text", text: "dm requires name and message" }],
-				details: { action, name: nameRaw },
-			};
+			return compactResult("dm requires name and message", { action, name: nameRaw });
 		}
 		const name = sanitizeName(nameRaw);
 		await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
@@ -60,19 +57,13 @@ export async function executeMessageAction(
 			text: message,
 			timestamp: new Date().toISOString(),
 		});
-		return {
-			content: [{ type: "text", text: `DM queued for ${formatMemberDisplayName(style, name)}` }],
-			details: { action, teamId, name, mailboxNamespace: TEAM_MAILBOX_NS },
-		};
+		return compactResult(`DM queued for ${formatMemberDisplayName(style, name)}`, { action, teamId, name, mailboxNamespace: TEAM_MAILBOX_NS });
 	}
 
 	if (action === "broadcast") {
 		const message = params.message?.trim();
 		if (!message) {
-			return {
-				content: [{ type: "text", text: "broadcast requires message" }],
-				details: { action },
-			};
+			return compactResult("broadcast requires message", { action });
 		}
 		const recipients = new Set<string>();
 		for (const m of cfg.members) {
@@ -107,31 +98,19 @@ export async function executeMessageAction(
 		const nameRaw = params.name?.trim();
 		const message = params.message?.trim();
 		if (!nameRaw || !message) {
-			return {
-				content: [{ type: "text", text: "steer requires name and message" }],
-				details: { action, name: nameRaw },
-			};
+			return compactResult("steer requires name and message", { action, name: nameRaw });
 		}
 		const name = sanitizeName(nameRaw);
 		const rpc = teammates.get(name);
 		if (!rpc) {
-			return {
-				content: [{ type: "text", text: `Unknown ${strings.memberTitle.toLowerCase()}: ${name}` }],
-				details: { action, name },
-			};
+			return compactResult(`Unknown ${strings.memberTitle.toLowerCase()}: ${name}`, { action, name });
 		}
 		await rpc.steer(message);
 		opts.renderWidget();
-		return {
-			content: [{ type: "text", text: `Steering sent to ${formatMemberDisplayName(style, name)}` }],
-			details: { action, teamId, name },
-		};
+		return compactResult(`Steering sent to ${formatMemberDisplayName(style, name)}`, { action, teamId, name });
 	}
 
-	return {
-		content: [{ type: "text", text: `Unsupported message action: ${String(action)}` }],
-		details: { action },
-	};
+	return compactResult(`Unsupported message action: ${String(action)}`, { action });
 }
 
 // ---------------------------------------------------------------------------

@@ -18,6 +18,7 @@ import type { ActivityTracker, TranscriptLog, TranscriptTracker } from "./activi
 import type { TeamConfig } from "./team-config.js";
 import type { InteractiveWidgetDeps } from "./teams-panel.js";
 import { fireAndForget } from "./fire-and-forget.js";
+import { getTeamDir } from "./paths.js";
 
 // ---------------------------------------------------------------------------
 // Closure state the callbacks need access to
@@ -164,8 +165,6 @@ export function buildWidgetCallbacks(wctx: WidgetCallbackContext): InteractiveWi
 // ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
-
-import { getTeamDir } from "./paths.js";
 
 function resolveTaskListId(wctx: WidgetCallbackContext): string {
 	const teamId = wctx.getCurrentTeamId() ?? wctx.ctx.sessionManager.getSessionId();

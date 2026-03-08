@@ -18,6 +18,7 @@ import {
 	TeamsThinkingLevelSchema,
 	TeamsModelSchema,
 } from "./leader-tool-shared.js";
+import { fireAndForget } from "./fire-and-forget.js";
 
 // ---------------------------------------------------------------------------
 // Schema
@@ -66,10 +67,7 @@ export async function executeDelegateAction(
 
 	const inputTasks = params.tasks ?? [];
 	if (inputTasks.length === 0) {
-		return {
-			content: [{ type: "text", text: "No tasks provided. Provide tasks: [{text, assignee?}, ...]" }],
-			details: { action: "delegate" },
-		};
+		return compactResult("No tasks provided. Provide tasks: [{text, assignee?}, ...]", { action: "delegate" });
 	}
 
 	const contextMode: ContextMode = params.contextMode === "branch" ? "branch" : "fresh";
@@ -174,7 +172,7 @@ export async function executeDelegateAction(
 		assignments.push({ taskId: task.id, assignee, subject });
 	}
 
-	void opts.refreshTasks().finally(opts.renderWidget);
+	fireAndForget(opts.refreshTasks().finally(opts.renderWidget), ctx);
 
 	const lines: string[] = [];
 	lines.push(`Delegated ${assignments.length} task(s):`);

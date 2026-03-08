@@ -90,17 +90,11 @@ export async function executePolicyAction(
 		const nameRaw = params.name?.trim();
 		const name = sanitizeName(nameRaw ?? "");
 		if (!name) {
-			return {
-				content: [{ type: "text", text: "plan_approve requires name" }],
-				details: { action, name: nameRaw },
-			};
+			return compactResult("plan_approve requires name", { action, name: nameRaw });
 		}
 		const pending = pendingPlanApprovals.get(name);
 		if (!pending) {
-			return {
-				content: [{ type: "text", text: `No pending plan approval for ${name}` }],
-				details: { action, name },
-			};
+			return compactResult(`No pending plan approval for ${name}`, { action, name });
 		}
 		const ts = new Date().toISOString();
 		await writeToMailbox(teamDir, TEAM_MAILBOX_NS, name, {
@@ -114,27 +108,18 @@ export async function executePolicyAction(
 			timestamp: ts,
 		});
 		pendingPlanApprovals.delete(name);
-		return {
-			content: [{ type: "text", text: `Approved plan for ${formatMemberDisplayName(style, name)}` }],
-			details: { action, teamId, name, requestId: pending.requestId, taskId: pending.taskId },
-		};
+		return compactResult(`Approved plan for ${formatMemberDisplayName(style, name)}`, { action, teamId, name, requestId: pending.requestId, taskId: pending.taskId });
 	}
 
 	if (action === "plan_reject") {
 		const nameRaw = params.name?.trim();
 		const name = sanitizeName(nameRaw ?? "");
 		if (!name) {
-			return {
-				content: [{ type: "text", text: "plan_reject requires name" }],
-				details: { action, name: nameRaw },
-			};
+			return compactResult("plan_reject requires name", { action, name: nameRaw });
 		}
 		const pending = pendingPlanApprovals.get(name);
 		if (!pending) {
-			return {
-				content: [{ type: "text", text: `No pending plan approval for ${name}` }],
-				details: { action, name },
-			};
+			return compactResult(`No pending plan approval for ${name}`, { action, name });
 		}
 		const feedback = params.feedback?.trim() || params.reason?.trim() || "Plan rejected";
 		const ts = new Date().toISOString();
@@ -150,10 +135,7 @@ export async function executePolicyAction(
 			timestamp: ts,
 		});
 		pendingPlanApprovals.delete(name);
-		return {
-			content: [{ type: "text", text: `Rejected plan for ${formatMemberDisplayName(style, name)}: ${feedback}` }],
-			details: { action, teamId, name, requestId: pending.requestId, taskId: pending.taskId, feedback },
-		};
+		return compactResult(`Rejected plan for ${formatMemberDisplayName(style, name)}: ${feedback}`, { action, teamId, name, requestId: pending.requestId, taskId: pending.taskId, feedback });
 	}
 
 	if (action === "model_get") {
@@ -282,15 +264,7 @@ export async function executePolicyAction(
 		const nextMaxReopens = params.hookMaxReopensPerTask;
 		const nextFollowupOwner = params.hookFollowupOwner;
 		if (!reset && nextFailureAction === undefined && nextMaxReopens === undefined && nextFollowupOwner === undefined) {
-			return {
-				content: [
-					{
-						type: "text",
-						text: "hooks_set requires at least one policy field (or hooksPolicyReset=true)",
-					},
-				],
-				details: { action, reset },
-			};
+			return compactResult("hooks_set requires at least one policy field (or hooksPolicyReset=true)", { action, reset });
 		}
 
 		const updatedCfg = await updateTeamHooksPolicy(teamDir, (current) => {
@@ -308,10 +282,7 @@ export async function executePolicyAction(
 			return next;
 		});
 		if (!updatedCfg) {
-			return {
-				content: [{ type: "text", text: "Failed to update hooks policy: team config missing" }],
-				details: { action, teamId },
-			};
+			return compactResult("Failed to update hooks policy: team config missing", { action, teamId });
 		}
 
 		await refreshUi();
@@ -342,10 +313,7 @@ export async function executePolicyAction(
 		);
 	}
 
-	return {
-		content: [{ type: "text", text: `Unsupported policy action: ${String(action)}` }],
-		details: { action },
-	};
+	return compactResult(`Unsupported policy action: ${String(action)}`, { action });
 }
 
 // ---------------------------------------------------------------------------
