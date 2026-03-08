@@ -5,7 +5,7 @@ import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@m
 import { SessionManager } from "@mariozechner/pi-coding-agent";
 import { listTasks, unassignTasksForAgent, type TeamTask } from "./task-store.js";
 import { TeammateRpc } from "./teammate-rpc.js";
-import { ensureTeamConfig, loadTeamConfig, setMemberStatus, upsertMember, type TeamConfig } from "./team-config.js";
+import { ensureTeamConfig, loadTeamConfig, setMemberStatus, type TeamConfig } from "./team-config.js";
 import { getTeamDir } from "./paths.js";
 import { heartbeatTeamAttachClaim, releaseTeamAttachClaim } from "./team-attach-claim.js";
 import { ActivityTracker, TranscriptTracker } from "./activity-tracker.js";

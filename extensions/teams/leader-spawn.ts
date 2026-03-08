@@ -63,7 +63,7 @@ function handleTeammateClose(
 	leaderTeamId: string,
 	code: number | null,
 ): void {
-	const { teammates, tracker, transcriptTracker, teammateEventUnsubs, getCurrentTeamId, getTaskListId, getStyle, refreshTasks, renderWidget } = spawnCtx;
+	const { tracker, transcriptTracker, teammateEventUnsubs, getCurrentTeamId, getTaskListId, getStyle, refreshTasks, renderWidget } = spawnCtx;
 	const style = getStyle();
 
 	try {

@@ -14,7 +14,7 @@ import { applyStatusChange, applyUnassign, applyReassign } from "./task-mutation
 import { setMemberStatus } from "./team-config.js";
 import type { TeammateRpc } from "./teammate-rpc.js";
 import { formatMemberDisplayName, getTeamsStrings, type TeamsStyle } from "./teams-style.js";
-import type { ActivityTracker, TranscriptLog, TranscriptTracker } from "./activity-tracker.js";
+import type { ActivityTracker, TranscriptTracker } from "./activity-tracker.js";
 import type { TeamConfig } from "./team-config.js";
 import type { InteractiveWidgetDeps } from "./teams-panel.js";
 import { fireAndForget } from "./fire-and-forget.js";
