@@ -2,6 +2,11 @@
  * Shared name sanitization.
  *
  * Must be stable across leader/worker/mailbox so file paths and mailbox ids match.
+ *
+ * **Trust boundary:** Sanitized names are interpolated into system prompts
+ * passed as CLI arguments (see `leader-spawn.ts`). The current allowlist
+ * (`[a-zA-Z0-9_-]`) is intentionally restrictive to prevent prompt injection.
+ * Do not relax this pattern without auditing all downstream interpolation sites.
  */
 export function sanitizeName(name: string): string {
 	return name.replace(/[^a-zA-Z0-9_-]/g, "-");

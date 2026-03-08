@@ -43,6 +43,14 @@ function getTeamsExtensionEntryPath(): string | null {
 	}
 }
 
+/**
+ * Shell-quote a value using single-quote wrapping with escaped interior quotes.
+ *
+ * **Display only** — used to construct CLI commands shown to the user (e.g.
+ * via `/team info`), never to build commands for programmatic execution.
+ * If execution use is ever needed, replace with a proper escaping library or
+ * use `child_process` argument arrays (as `TeammateRpc.start` already does).
+ */
 function shellQuote(v: string): string {
 	return "'" + v.replace(/'/g, `"'"'"'`) + "'";
 }
