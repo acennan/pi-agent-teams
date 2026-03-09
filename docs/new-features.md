@@ -1,6 +1,6 @@
 ### New Features to Add
 
-#### Feature 1: Team Identifier
+### Feature 1: Team Identifier
 
 The team uses a string as a unique identifier to enable output from different teams to be kept in isolation. This is currently being set as the session identifier. The format of this is not intuitive, meaning that it is hard to identify which folder belongs with which team.
 
@@ -9,7 +9,7 @@ A better solution would be to allow the team identifier to be set on team creati
 As the identifier must be unique, it needs to be checked at team creation to ensure it is. If not, an error should be displayed and the user told to select a different name.
 
 
-#### Feature 2: Add failed Task Status
+### Feature 2: Add failed Task Status
 
 Add support for a `"failed"` task status. A task is set to `"failed"` when it cannot be completed due to cyclic review failures.
 
@@ -58,7 +58,7 @@ Failed tasks are terminal:
 - `protocol.ts`: Already supports `completedStatus: "failed"` — no change needed.
 
 
-#### Feature 3: Code → Review → Commit Flow and Related Tasks
+### Feature 3: Code → Review → Commit Flow and Related Tasks
 
 Feature that defines the core task flow: **code → review → commit**.
 
@@ -211,26 +211,61 @@ The requested task is highlighted with angle brackets. The traversal follows all
 
 The existing quality-gate hook mechanism (`on_task_completed`) can continue to run as an **additional validation layer** (e.g. running linting or tests) independent of the structured review result. However, the reopen/followup logic it currently drives is replaced by the structured flow described above. The hook's role becomes purely informational — reporting pass/fail — while the leader's flow logic handles task creation and cycle management.
 
-#### Feature 4: Worker Context Management
+### Feature 4: Worker Context Management
 
 When a worker finishes a task its `onAgentEnd` handler immediately looks for more work (`maybeStartNextWork`). Every successive task prompt, tool call, and response is appended to the same conversation. The only safety net is pi's generic auto-compaction, which is lossy and uncontrolled. Over several tasks the worker's context fills with irrelevant history, increasing the chance of hallucination, degraded instruction-following, and eventual context-window overflow.
 
 A new `--keepContext` flag should be introduced so that the default behaviour becomes kill-and-respawn after every completed task. This will give each task a fresh context window. Passing `--keepContext` preserves the current behaviour.
 
 
-#### Feature 5: Worktree Management
+### Feature 5: Worktree Management
 
-Every "code" task should work on its own branch via a worktree. 
+Every code → review → commit flow chain should work on its own branch via a git worktree. The worktree is scoped to the **flow chain**, not the individual agent — all tasks in a chain (code, review, commit, and any fix cycles) share the same worktree. This allows different agents to work on related tasks (e.g. one agent codes, another reviews) while operating on the same branch and code changes.
+
 ```shell
 git worktree add <path>
 ```
 The `<path>` is the location of the worktree directory, whose name is the final component.
 
-On team creation a new option, `--worktreeDir`, should be introduced to specify the path of the directory where worktrees should be created. If this is not supplied, then the default is to create a new directory called `worktrees` within the current directory. The branch name convention should be `<team-name>-<task-id>`, and should be appended to the path. The path can be absolute,
+##### Worktree Directory
+
+On team creation a new option, `--worktreeDir`, should be introduced to specify the path of the directory where worktrees should be created. If this is not supplied, then the default is to create a new directory called `worktrees` within the current directory. This option is immutable once set. Relative paths are resolved against the leader's working directory at team creation time and stored as absolute in the team config.
+
+##### Branch and Path Convention
+
+The branch name convention is `<team-name>-<task-id>`, where `<task-id>` is the root code task of the flow. This is appended to the worktree directory to form the full path. The path can be absolute,
 ```shell
-git worktree add /home/user/project/team-name-23
+git worktree add /home/user/project/worktrees/team-name-23
 ```
 or relative,
 ```shell
 git worktree add ../wtrees/team-name-23
 ```
+
+##### Worktree Lifecycle
+
+1. **Creation:** When a code task is created as part of a flow chain (Feature 3), the leader creates the worktree and stores the path in the code task's `metadata.worktreePath`. The linked review and commit tasks inherit this path.
+2. **Fix cycles:** When a review fails and new code + review tasks are created, they inherit the same `worktreePath` — fixes are committed to the same branch.
+3. **Cleanup:** The worktree is automatically removed when the chain reaches a terminal state:
+   - Commit task completes successfully, or
+   - Root code task is marked as `"failed"` (Feature 2).
+   
+   The git **branch is preserved** after cleanup for later inspection or merging — only the working copy is removed.
+
+##### Concurrent Worktree Limits
+
+The number of concurrent worktrees is bounded by the number of agents, not the number of tasks. With 4 agents and 100 feature tasks, at most ~4 worktrees exist at any time, processed as a rolling wave with cleanup occurring as chains complete.
+
+##### Discovery
+
+Workers discover their working directory from `metadata.worktreePath` on the task they pick up. With `--keepContext` off (Feature 4, the default), the leader sets the correct `cwd` on the fresh worker process. With `--keepContext` on, the task prompt instructs the worker to change to the worktree directory.
+
+##### Observability
+
+Two new commands support manual oversight:
+- `/team worktree list` — shows active worktrees with their associated task and status.
+- `/team worktree clean [--force]` — removes worktrees whose flow chains have reached a terminal state (or force-removes all).
+
+##### Deprecation
+
+The existing per-agent `worktree` option on `/team spawn` is deprecated. Worktrees are now created per flow chain, not per agent.
