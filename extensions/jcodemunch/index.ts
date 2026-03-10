@@ -9,6 +9,9 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { Type } from "@sinclair/typebox";
+import { dirname, basename, join } from "path";
+import { fileURLToPath } from "url";
 
 // Supported source extensions (mirrors jcodemunch-mcp's language support)
 const SOURCE_EXTENSIONS = new Set([
@@ -170,10 +173,10 @@ print(json.dumps(result))
 				}
 				updateStatus(ctx, parts.join(", "), "success");
 			}
-		} catch (err: any) {
+		} catch (err: unknown) {
 			lastError = err.message || String(err);
 			// Truncate long error messages for the footer
-			const shortErr = lastError!.length > 80 ? lastError!.slice(0, 77) + "..." : lastError;
+			const shortErr = lastError?.length > 80 ? lastError?.slice(0, 77) + "..." : lastError;
 			updateStatus(ctx, `Index error: ${shortErr}`, "error");
 		} finally {
 			indexing = false;
@@ -226,7 +229,7 @@ print(json.dumps(result))
 				stopWatcher();
 				setTimeout(() => startWatcher(ctx), 5000);
 			});
-		} catch (err: any) {
+		} catch (err: unknown) {
 			updateStatus(ctx, `Cannot watch: ${err.message}`, "error");
 		}
 	}
@@ -248,7 +251,7 @@ print(json.dumps(result))
 	/**
 	 * Run a Python snippet that prints JSON and return the parsed result.
 	 */
-	async function runPythonJson(script: string): Promise<any> {
+	async function runPythonJson(script: string): Promise<string> {
 		const result = await pi.exec(pythonPath, ["-c", script], { timeout: 120_000 });
 		if (result.code !== 0) {
 			const errMsg = (result.stderr || result.stdout || "Unknown error").trim();
@@ -287,7 +290,7 @@ print(json.dumps(list_repos()))
 				}
 				lines.push(`\n${repos.length} repo(s), query took ${data._meta?.timing_ms ?? "?"}ms`);
 				ctx.ui.notify(lines.join("\n"), "info");
-			} catch (err: any) {
+			} catch (err: unknown) {
 				ctx.ui.notify(`list_repos failed: ${err.message}`, "error");
 			}
 		},
@@ -312,7 +315,7 @@ print(json.dumps(invalidate_cache(repo=${JSON.stringify(repo)})))
 				} else {
 					ctx.ui.notify(`invalidate_cache: ${data.error ?? data.message ?? "unknown error"}`, "error");
 				}
-			} catch (err: any) {
+			} catch (err: unknown) {
 				ctx.ui.notify(`invalidate_cache failed: ${err.message}`, "error");
 			}
 		},
@@ -339,8 +342,8 @@ print(json.dumps(get_repo_outline(repo=${JSON.stringify(repo)})))
 				const parts: string[] = [];
 				if (data.repo) parts.push(`Repo: ${data.repo}`);
 				if (data.indexed_at) parts.push(`Indexed at: ${data.indexed_at}`);
-				if (data.file_count != null) parts.push(`Files: ${data.file_count}`);
-				if (data.symbol_count != null) parts.push(`Symbols: ${data.symbol_count}`);
+				if (data.file_count !== null) parts.push(`Files: ${data.file_count}`);
+				if (data.symbol_count !== null) parts.push(`Symbols: ${data.symbol_count}`);
 				if (data.languages) {
 					const langs = Object.entries(data.languages)
 						.map(([lang, count]) => `  ${lang}: ${count}`)
@@ -365,14 +368,14 @@ print(json.dumps(get_repo_outline(repo=${JSON.stringify(repo)})))
 				if (data._meta) {
 					const m = data._meta;
 					const metaLines = [`  timing: ${m.timing_ms ?? "?"}ms`];
-					if (m.tokens_saved != null) metaLines.push(`  tokens saved: ${m.tokens_saved}`);
-					if (m.total_tokens_saved != null) metaLines.push(`  total tokens saved: ${m.total_tokens_saved}`);
-					if (m.cost_avoided_usd != null) metaLines.push(`  cost avoided: $${m.cost_avoided_usd}`);
-					if (m.total_cost_avoided_usd != null) metaLines.push(`  total cost avoided: $${m.total_cost_avoided_usd}`);
+					if (m.tokens_saved !== null) metaLines.push(`  tokens saved: ${m.tokens_saved}`);
+					if (m.total_tokens_saved !== null) metaLines.push(`  total tokens saved: ${m.total_tokens_saved}`);
+					if (m.cost_avoided_usd !== null) metaLines.push(`  cost avoided: $${m.cost_avoided_usd}`);
+					if (m.total_cost_avoided_usd !== null) metaLines.push(`  total cost avoided: $${m.total_cost_avoided_usd}`);
 					parts.push(`Meta:\n${metaLines.join("\n")}`);
 				}
 				ctx.ui.notify(parts.join("\n"), "info");
-			} catch (err: any) {
+			} catch (err: unknown) {
 				ctx.ui.notify(`get_repo_outline failed: ${err.message}`, "error");
 			}
 		},
@@ -382,7 +385,7 @@ print(json.dumps(get_repo_outline(repo=${JSON.stringify(repo)})))
 
 	pi.on("session_start", async (_event, ctx) => {
 		projectDir = ctx.cwd;
-		pythonPath = path.join(projectDir, ".venv", "bin", "python");
+		pythonPath = path.join(`${process.env.HOME}`, ".venv", "bin", "python");
 
 		// Verify python + jcodemunch are available
 		try {
@@ -422,4 +425,334 @@ print(json.dumps(get_repo_outline(repo=${JSON.stringify(repo)})))
 			scheduleReindex(ctx);
 		}
 	});
+
+	// -----------------------------------------------------------------------
+	// Tools
+	// -----------------------------------------------------------------------
+
+	pi.registerTool({
+		name: "search_symbols",
+		label: "Search Symbols",
+		description:
+			"Search for code symbols (functions, classes, methods, constants, types) across the indexed project. Returns matching symbols with signatures and summaries. Use this before reading entire files to find the exact code you need.",
+		promptSnippet:
+			"Search for code symbols by name, kind, or language. More efficient than reading entire files.",
+		promptGuidelines: [
+			"Before reading entire files, use search_symbols to find specific functions, classes, or methods.",
+			"Use the symbol IDs from search results with get_symbol to retrieve full source code.",
+		],
+		parameters: Type.Object({
+			query: Type.String({ description: "Search query (matches symbol names, signatures, summaries)" }),
+			kind: Type.Optional(
+				Type.String({
+					description: "Filter by symbol kind: function, class, method, constant, type",
+				}),
+			),
+			language: Type.Optional(
+				Type.String({
+					description: "Filter by language: python, javascript, typescript, go, rust, java, php, dart, csharp, c",
+				}),
+			),
+			file_pattern: Type.Optional(
+				Type.String({ description: "Glob pattern to filter files (e.g., 'src/**/*.ts')" }),
+			),
+			max_results: Type.Optional(
+				Type.Number({ description: "Maximum results to return (default: 20, max: 100)" }),
+			),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const repo = repoId(ctx.cwd);
+			const args = ["search_symbols", repo, params.query];
+
+			if (params.kind) {
+				args.push("--kind", params.kind);
+			}
+			if (params.language) {
+				args.push("--language", params.language);
+			}
+			if (params.file_pattern) {
+				args.push("--file-pattern", params.file_pattern);
+			}
+			if (params.max_results !== undefined) {
+				args.push("--max-results", String(params.max_results));
+			}
+
+			const result = await callCli(pi, args, { signal: signal ?? undefined, cwd: ctx.cwd });
+
+			if (result.error) {
+				throw new Error(result.error as string);
+			}
+
+			const results = (result.results ?? []) as Array<Record<string, unknown>>;
+			if (results.length === 0) {
+				return {
+					content: [{ type: "text", text: `No symbols found matching "${params.query}".` }],
+					details: result,
+				};
+			}
+
+			const lines = results.map((sym) => {
+				const parts = [
+					`${sym.kind} ${sym.name}`,
+					`  file: ${sym.file}:${sym.line}`,
+					`  id: ${sym.id}`,
+					`  signature: ${sym.signature}`,
+				];
+				if (sym.summary) {
+					parts.push(`  summary: ${sym.summary}`);
+				}
+				return parts.join("\n");
+			});
+
+			const header = `Found ${results.length} symbol(s) matching "${params.query}":`;
+			const text = [header, "", ...lines].join("\n");
+
+			return {
+				content: [{ type: "text", text }],
+				details: result,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "get_symbol",
+		label: "Get Symbol",
+		description:
+			"Retrieve the full source code of a specific symbol by its ID. Use after search_symbols or file_outline to read exact implementations without loading entire files.",
+		promptSnippet: "Retrieve full source of a symbol by ID. O(1) byte-offset seeking.",
+		promptGuidelines: [
+			"Use get_symbol to read exact function/class implementations instead of reading full files.",
+			"Symbol IDs come from search_symbols or file_outline results.",
+		],
+		parameters: Type.Object({
+			symbol_id: Type.String({
+				description:
+					"Symbol ID in the format file_path::qualified_name#kind (from search_symbols or file_outline)",
+			}),
+			context_lines: Type.Optional(
+				Type.Number({
+					description: "Number of surrounding lines to include for context (default: 0, max: 50)",
+				}),
+			),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const repo = repoId(ctx.cwd);
+			const args = ["get_symbol", repo, params.symbol_id];
+
+			if (params.context_lines !== undefined) {
+				args.push("--context-lines", String(params.context_lines));
+			}
+
+			const result = await callCli(pi, args, { signal: signal ?? undefined, cwd: ctx.cwd });
+
+			if (result.error) {
+				throw new Error(result.error as string);
+			}
+
+			const parts: string[] = [];
+
+			// Header
+			parts.push(`${result.kind} ${result.name} (${result.file}:${result.line}-${result.end_line})`);
+			parts.push(`ID: ${result.id}`);
+			if (result.signature) {
+				parts.push(`Signature: ${result.signature}`);
+			}
+			parts.push("");
+
+			// Context before
+			if (result.context_before) {
+				parts.push("--- context before ---");
+				parts.push(result.context_before as string);
+				parts.push("--- symbol source ---");
+			}
+
+			// Source
+			parts.push(result.source as string);
+
+			// Context after
+			if (result.context_after) {
+				parts.push("--- context after ---");
+				parts.push(result.context_after as string);
+			}
+
+			return {
+				content: [{ type: "text", text: parts.join("\n") }],
+				details: result,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "get_symbols",
+		label: "Get Symbols (batch)",
+		description:
+			"Batch retrieve full source code of multiple symbols by their IDs. More efficient than calling get_symbol repeatedly.",
+		promptSnippet: "Batch retrieve source of multiple symbols in one call.",
+		promptGuidelines: [
+			"Use get_symbols when you need to read multiple related symbols (e.g., all methods of a class).",
+		],
+		parameters: Type.Object({
+			symbol_ids: Type.Array(Type.String(), {
+				description: "List of symbol IDs to retrieve",
+			}),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const repo = repoId(ctx.cwd);
+			const args = ["get_symbols", repo, ...params.symbol_ids];
+
+			const result = await callCli(pi, args, { signal: signal ?? undefined, cwd: ctx.cwd });
+
+			if (result.error) {
+				throw new Error(result.error as string);
+			}
+
+			const symbols = (result.symbols ?? []) as Array<Record<string, unknown>>;
+			const errors = (result.errors ?? []) as Array<Record<string, unknown>>;
+
+			const parts: string[] = [];
+
+			for (const sym of symbols) {
+				parts.push(`--- ${sym.kind} ${sym.name} (${sym.file}:${sym.line}-${sym.end_line}) ---`);
+				parts.push(`ID: ${sym.id}`);
+				parts.push("");
+				parts.push(sym.source as string);
+				parts.push("");
+			}
+
+			if (errors.length > 0) {
+				parts.push("--- errors ---");
+				for (const err of errors) {
+					parts.push(`${err.id}: ${err.error}`);
+				}
+			}
+
+			return {
+				content: [{ type: "text", text: parts.join("\n") }],
+				details: result,
+			};
+		},
+	});
+
+	pi.registerTool({
+		name: "file_outline",
+		label: "File Outline",
+		description:
+			"Get the symbol hierarchy for a file: all functions, classes, methods with their signatures. Does not include source code. Use to understand a file's API surface before reading it.",
+		promptSnippet: "Get symbol hierarchy for a file (signatures, no source). Use before reading a file.",
+		promptGuidelines: [
+			"Use file_outline to understand a file's API surface before reading the full file.",
+			"Use the symbol IDs from the outline with get_symbol to retrieve specific implementations.",
+		],
+		parameters: Type.Object({
+			file_path: Type.String({
+				description: "Path to the file relative to the project root (e.g., 'src/main.py')",
+			}),
+		}),
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+			const repo = repoId(ctx.cwd);
+			const args = ["file_outline", repo, params.file_path];
+
+			const result = await callCli(pi, args, { signal: signal ?? undefined, cwd: ctx.cwd });
+
+			if (result.error) {
+				throw new Error(result.error as string);
+			}
+
+			const symbols = (result.symbols ?? []) as Array<Record<string, unknown>>;
+
+			if (symbols.length === 0) {
+				return {
+					content: [
+						{
+							type: "text",
+							text: `No symbols found in ${params.file_path}. The file may not contain supported language constructs, or the project may need re-indexing (/reindex).`,
+						},
+					],
+					details: result,
+				};
+			}
+
+			function formatSymbol(sym: Record<string, unknown>, indent: number): string[] {
+				const prefix = "  ".repeat(indent);
+				const lines = [
+					`${prefix}${sym.kind} ${sym.name} (line ${sym.line})`,
+					`${prefix}  id: ${sym.id}`,
+					`${prefix}  signature: ${sym.signature}`,
+				];
+				if (sym.summary) {
+					lines.push(`${prefix}  summary: ${sym.summary}`);
+				}
+				const children = (sym.children ?? []) as Array<Record<string, unknown>>;
+				for (const child of children) {
+					lines.push(...formatSymbol(child, indent + 1));
+				}
+				return lines;
+			}
+
+			const header = `${params.file_path} (${result.language ?? "unknown"}, ${symbols.length} top-level symbols):`;
+			const body = symbols.flatMap((sym) => formatSymbol(sym, 0));
+
+			return {
+				content: [{ type: "text", text: [header, "", ...body].join("\n") }],
+				details: result,
+			};
+		},
+	});
+
+	// ---------------------------------------------------------------------------
+	// Helpers
+	// ---------------------------------------------------------------------------
+
+	/** Resolve the path to cli.py relative to this extension file. */
+	function cliPath(): string {
+		const thisFile = fileURLToPath(import.meta.url);
+		return join(dirname(thisFile), "cli.py");
+	}
+
+	/** The repo identifier jcodemunch uses for local folders: "local/<dirname>". */
+	function repoId(cwd: string): string {
+		return `local/${basename(cwd)}`;
+	}
+
+	interface CallResult {
+		success?: boolean;
+		error?: string;
+		[key: string]: unknown;
+	}
+
+	/**
+	 * Call the jcodemunch CLI bridge and parse the JSON response.
+	 * Uses pi.exec() so abort signals and timeouts are handled.
+	 */
+	async function callCli(
+		pi: ExtensionAPI,
+		args: string[],
+		options?: { signal?: AbortSignal; timeout?: number; cwd?: string },
+	): Promise<CallResult> {
+		const result = await pi.exec("python3", [cliPath(), ...args], {
+			signal: options?.signal,
+			timeout: options?.timeout ?? 120_000,
+			cwd: options?.cwd,
+		});
+
+		if (result.code !== 0) {
+			// Try to parse stderr or stdout for a JSON error from the CLI
+			const output = result.stdout || result.stderr;
+			try {
+				const parsed = JSON.parse(output);
+				if (parsed.error) {
+					return parsed as CallResult;
+				}
+			} catch {
+				// Not JSON
+			}
+			return { error: `CLI exited with code ${result.code}: ${output.slice(0, 500)}` };
+		}
+
+		try {
+			return JSON.parse(result.stdout) as CallResult;
+		} catch {
+			return { error: `Invalid JSON from CLI: ${result.stdout.slice(0, 500)}` };
+		}
+	}
 }

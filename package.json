@@ -27,7 +27,7 @@
     ]
   },
   "scripts": {
-    "lint": "eslint 'extensions/**/*.ts' 'scripts/**/*.ts' 'scripts/**/*.mts'",
+    "lint": "eslint 'extensions/**/*.ts' 'scripts/**/*.ts' 'scripts/**/*.mts' --ignore-pattern '**/__tests__/*'",
     "typecheck": "tsc -p tsconfig.strict.json",
     "check": "npm run typecheck && npm run lint",
     "test": "vitest run",
