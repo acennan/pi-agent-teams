@@ -29,6 +29,7 @@ Write one file per JSON object. The file name will be `<id>.json`. Each JSON obj
 ```typescript
 interface TeamTask {
   id: string;            // sequential stringified integer: "1", "2", ...
+  task: string;          // type of task: one of "code", "review", "commit"
   subject: string;       // short one-line summary
   description: string;   // condensed implementation details (see below)
   owner?: string;        // leave undefined — the team will auto-claim
@@ -73,12 +74,11 @@ Use your judgement. Prefer slightly more granular over slightly too coarse — a
 
 Every code-change task must have a corresponding review task. This creates a quality gate: work is not considered complete until it has been reviewed.
 
-**Code-change tasks** are tasks that create or modify source files (application code, config, types, etc.).
-
-**Non-code tasks** do not get review tasks. These include:
+**Code-change tasks** are tasks that include:
+- Creation or modification of source files (application code, config, types, etc.)
 - Verification-only tasks (e.g., "confirm env var propagates")
 - Documentation-only updates
-- Test-writing tasks (tests are themselves a form of verification)
+- Writing unit and integration tests
 
 **For each code-change task, generate a review companion:**
 
@@ -91,7 +91,22 @@ Every code-change task must have a corresponding review task. This creates a qua
 
 Place the review task immediately after its code task in the task directory so related work is grouped together.
 
-### 4. Write condensed descriptions
+### 4. Generate commit tasks
+
+Every review-change task must have a corresponding commit task. This ensures all changes are captured.
+
+**For each code-change task, generate a review companion:**
+
+- **Subject:** `"Commit: <original subject>"`
+- **Description:** What to commit — all files that are new, deleted or modified. Find these via `git status`.
+- **`blockedBy`:** the review task's ID.
+- **Metadata cross-references:**
+  - On the review task: `"commitTaskId": "<commit-task-id>"`
+  - On the commit task: `"reviewTaskId": "<review-task-id>"`
+
+Place the commit task immediately after its review task in the task directory so related work is grouped together.
+
+### 5. Write condensed descriptions
 
 Each `TeamTask.description` should contain only what an agent needs to implement (or review) the task:
 
@@ -112,7 +127,7 @@ The plan's "Dependencies" field lists plan task numbers (e.g., "Dependencies: Ta
 
 Because a single plan task can become multiple team tasks, track the mapping carefully:
 
-- Keep a mapping of `planTask → { codeTaskIds: [...], reviewTaskIds: [...] }`.
+- Keep a mapping of `planTask → { codeTaskIds: [...], reviewTaskIds: [...], commitTaskIds: [...] }`.
 - When plan Task B depends on plan Task A, every code task derived from plan Task B should list the *review* task IDs from plan Task A in its `blockedBy`. This enforces the quality gate.
 - Within a plan task that was split into multiple code tasks, chain them sequentially if they have an internal order — later code tasks in the group are `blockedBy` earlier ones in the same group.
 - Populate `blocks` as the inverse of every `blockedBy` entry.
@@ -124,6 +139,7 @@ Because a single plan task can become multiple team tasks, track the mapping car
 | Code task → its own review | Review is `blockedBy` the code task |
 | Code task → upstream plan dependency | Code task is `blockedBy` the upstream *review* tasks |
 | Code tasks within same split group | Later code task is `blockedBy` earlier code task |
+| Review task → its own commit | Commit is `blockedBy` the review task |
 
 ### 6. Set metadata
 
@@ -141,7 +157,8 @@ Each `TeamTask.metadata` should include:
 
 Additionally, for code/review pairs:
 - Code task metadata includes `"reviewTaskId": "<id>"`.
-- Review task metadata includes `"codeTaskId": "<id>"`.
+- Review task metadata includes `"codeTaskId": "<id>"` and `"commitTaskId": "<id>"`.
+- Commit task metadata includes `"reviewTaskId": "<id>"`.
 
 ### 7. Write the JSON files
 
@@ -182,18 +199,12 @@ This produces:
 ```
 ID  Subject                                              blockedBy  blocks   metadata
 ──  ───────                                              ─────────  ──────   ────────
-1   Add /team create subcommand with --id flag           []         [2,3]    planTask:"Task 1", reviewTaskId:"2"
-2   Review: Add /team create subcommand with --id flag   [1]        [3]      planTask:"Task 1", codeTaskId:"1"
-3   Implement handleTeamCreateCommand                    [2]        [4]      planTask:"Task 2", reviewTaskId:"4"
-4   Review: Implement handleTeamCreateCommand            [3]        []       planTask:"Task 2", codeTaskId:"3"
+1   Add /team create subcommand with --id flag           []         [2,4]    planTask:"Task 1", reviewTaskId:"2"
+2   Review: Add /team create subcommand with --id flag   [1]        [3]      planTask:"Task 1", codeTaskId:"1", commitTask:"3"
+3   Commit: Add /team create subcommand with --id flag   [2]        [4]      planTask:"Task 1", reviewTaskId:"2"
+4   Implement handleTeamCreateCommand                    [3]        [5]      planTask:"Task 2", reviewTaskId:"4"
+5   Review: Implement handleTeamCreateCommand            [4]        [6]      planTask:"Task 2", codeTaskId:"4", commitTask:"6"
+6   Commit: Implement handleTeamCreateCommand            [5]        []       planTask:"Task 2", reviewTaskId:"5"
 ```
 
-Note how task 3 (code for plan Task 2) is `blockedBy` task 2 (the *review* of plan Task 1), not task 1 (the code). This ensures plan Task 1 is fully reviewed before dependent work begins.
-
-## Edge cases
-
-- **Verification-only tasks** (e.g., "no code change expected, just verify manually") — create a team task but no review companion. Set the description to explain what to verify and how.
-- **Test-writing tasks** — create a team task but no review companion. Tests are themselves verification.
-- **Tasks with no dependencies** — `blockedBy` and `blocks` are empty arrays, not omitted.
-- **Plan tasks that are pure documentation** — no review companion. Documentation tasks are non-code.
-- **A plan task that splits into a mix of code and non-code** — only the code sub-tasks get review companions.
+Note how task 4 (code for plan Task 2) is `blockedBy` task 3 (the *commit* of plan Task 1), not task 1 (the code). This ensures plan Task 1 is fully committed before dependent work begins.
